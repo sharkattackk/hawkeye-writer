@@ -1,10 +1,11 @@
 import dataclasses
 import importlib.util
+import json
 
 import aws_cdk as cdk
 from aws_cdk.assertions import Match, Template
 
-from pipeline.config import load_config
+from pipeline.config import ApiConfig, load_config
 from pipeline.lambda_stack import LAMBDA_DIR, LambdaStack
 from pipeline.pipeline_stack import PipelineStack
 
@@ -75,11 +76,67 @@ def test_pipeline_stack():
     )
 
 
-def test_handler():
+def test_api():
+    api_config = ApiConfig(
+        user_pool_id="us-east-2_example",
+        user_pool_client_ids=["exampleclient"],
+        cors_origins=["http://localhost:5173"],
+    )
+    stack = LambdaStack(_app(), "Lambda", config=dataclasses.replace(config, api=api_config))
+    template = Template.from_stack(stack)
+
+    template.has_resource_properties(
+        "AWS::ApiGatewayV2::Api",
+        {
+            "ProtocolType": "HTTP",
+            "CorsConfiguration": Match.object_like({"AllowOrigins": ["http://localhost:5173"]}),
+        },
+    )
+    template.has_resource_properties(
+        "AWS::ApiGatewayV2::Route",
+        {"RouteKey": "POST /invoke", "AuthorizationType": "JWT"},
+    )
+    template.has_resource_properties(
+        "AWS::ApiGatewayV2::Authorizer",
+        {
+            "AuthorizerType": "JWT",
+            "JwtConfiguration": {
+                "Audience": ["exampleclient"],
+                "Issuer": Match.any_value(),
+            },
+        },
+    )
+
+
+def test_no_api_by_default():
+    stack = LambdaStack(_app(), "Lambda", config=dataclasses.replace(config, api=None))
+    Template.from_stack(stack).resource_count_is("AWS::ApiGatewayV2::Api", 0)
+
+
+def _load_handler():
     # "lambda" is a Python keyword, so load the module by path
     spec = importlib.util.spec_from_file_location("handler", LAMBDA_DIR / "handler.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module.handler
 
-    response = module.handler({}, None)
+
+def test_write_runmode():
+    response = _load_handler()({"body": json.dumps({"runmode": "write"})}, None)
     assert response["statusCode"] == 200
+    assert json.loads(response["body"]) == {"message": "writer wrote"}
+
+
+def test_direct_invoke():
+    response = _load_handler()({"runmode": "write"}, None)
+    assert json.loads(response["body"]) == {"message": "writer wrote"}
+
+
+def test_unknown_runmode():
+    response = _load_handler()({"body": json.dumps({"runmode": "nope"})}, None)
+    assert response["statusCode"] == 400
+
+
+def test_invalid_body():
+    response = _load_handler()({"body": "not json"}, None)
+    assert response["statusCode"] == 400

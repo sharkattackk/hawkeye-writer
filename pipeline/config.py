@@ -8,6 +8,20 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 
 
 @dataclass(frozen=True)
+class ApiConfig:
+    """API Gateway (HTTP API) in front of the Lambda, secured by a Cognito user pool."""
+
+    # Only users from this pool can call the API
+    user_pool_id: str
+    # App clients whose tokens are accepted (the frontend's Cognito app client)
+    user_pool_client_ids: list[str]
+    # Browser origins allowed to call the API
+    cors_origins: list[str] = field(default_factory=list)
+    # Route the frontend POSTs to
+    path: str = "/invoke"
+
+
+@dataclass(frozen=True)
 class Config:
     app_name: str
     github_owner: str
@@ -23,6 +37,7 @@ class Config:
     log_retention_days: int = 30
     function_url: bool = False
     environment: dict = field(default_factory=dict)
+    api: ApiConfig | None = None
 
     @property
     def repo_path(self) -> str:

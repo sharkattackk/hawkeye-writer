@@ -1,12 +1,16 @@
 from pathlib import Path
 
 from aws_cdk import CfnOutput, Duration, RemovalPolicy, Stack
+from aws_cdk import aws_apigatewayv2 as apigw
+from aws_cdk import aws_apigatewayv2_authorizers as authorizers
+from aws_cdk import aws_apigatewayv2_integrations as integrations
+from aws_cdk import aws_cognito as cognito
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_lambda_python_alpha as python
 from aws_cdk import aws_logs as logs
 from constructs import Construct
 
-from pipeline.config import Config
+from pipeline.config import ApiConfig, Config
 
 LAMBDA_DIR = Path(__file__).resolve().parent.parent / "lambda"
 
@@ -54,6 +58,42 @@ class LambdaStack(Stack):
         if config.function_url:
             url = self.function.add_function_url(auth_type=lambda_.FunctionUrlAuthType.NONE)
             CfnOutput(self, "FunctionUrl", value=url.url)
+
+        if config.api:
+            self._add_api(config.app_name, config.api)
+
+    def _add_api(self, app_name: str, api_config: ApiConfig) -> None:
+        user_pool = cognito.UserPool.from_user_pool_id(self, "UserPool", api_config.user_pool_id)
+        clients = [
+            cognito.UserPoolClient.from_user_pool_client_id(self, f"UserPoolClient{i}", client_id)
+            for i, client_id in enumerate(api_config.user_pool_client_ids)
+        ]
+
+        api = apigw.HttpApi(
+            self,
+            "Api",
+            api_name=app_name,
+            # API Gateway answers CORS preflight itself, before the authorizer runs
+            cors_preflight=apigw.CorsPreflightOptions(
+                allow_origins=api_config.cors_origins,
+                allow_methods=[apigw.CorsHttpMethod.POST, apigw.CorsHttpMethod.OPTIONS],
+                allow_headers=["authorization", "content-type"],
+                max_age=Duration.days(1),
+            ),
+        )
+
+        api.add_routes(
+            path=api_config.path,
+            methods=[apigw.HttpMethod.POST],
+            integration=integrations.HttpLambdaIntegration("Integration", self.function),
+            authorizer=authorizers.HttpUserPoolAuthorizer(
+                "Authorizer",
+                user_pool,
+                user_pool_clients=clients,
+            ),
+        )
+
+        CfnOutput(self, "ApiUrl", value=f"{api.api_endpoint}{api_config.path}")
 
 
 RETENTION = {
