@@ -2,7 +2,7 @@
 # Usually that just means changing app_name.
 
 # Names the Lambda, its stack and its pipeline. Lowercase letters, numbers and hyphens.
-app_name: lambda-cdk-template
+app_name: hawkeye-writer
 
 github:
   owner: sharkattackk
@@ -12,7 +12,7 @@ github:
   branch: production
   # AWS CodeConnections ARN for GitHub (Developer Tools > Settings > Connections).
   # One connection is shared by every repo you grant it access to.
-  connection_arn: REPLACE_WITH_CONNECTION_ARN
+  connection_arn: arn:aws:codeconnections:us-east-2:107489387706:connection/d7ba20e6-0fa2-48be-ae5b-20ccbce1deaf
 
 aws:
   account: "107489387706"
