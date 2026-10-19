@@ -28,7 +28,7 @@ def handler(monkeypatch):
 def call(handler, body, user=USER):
     event = {"body": json.dumps(body)}
     if user:
-        event["requestContext"] = {"authorizer": {"jwt": {"claims": {"sub": user}}}}
+        event["requestContext"] = {"authorizer": {"jwt": {"claims": {"sub": user, "email": f"{user}@example.com"}}}}
     response = handler(event, None)
     return response["statusCode"], json.loads(response["body"])
 
@@ -107,3 +107,131 @@ def test_unknown_runmode(handler):
 def test_invalid_body(handler):
     response = handler({"body": "not json"}, None)
     assert response["statusCode"] == 400
+
+
+# --- accounts and marinas
+
+def register(handler, user=USER):
+    status, body = call(handler, {"runmode": "register_user"}, user)
+    assert status == 200
+    return body
+
+
+def complete_profile(handler, user=USER):
+    return call(handler, {"runmode": "update_profile", "first_name": "Ada", "last_name": "Lovelace"}, user)
+
+
+def test_register_user(handler):
+    body = register(handler)
+    assert body["user"]["email"] == f"{USER}@example.com"
+    assert body["user"]["profile_completed_at"] is None
+    assert body["marina"] is None
+
+
+def test_register_user_is_idempotent(handler):
+    first = register(handler)
+    second = register(handler)
+    assert first["user"]["id"] == second["user"]["id"]
+
+
+def test_register_user_requires_email(handler):
+    event = {
+        "body": json.dumps({"runmode": "register_user"}),
+        "requestContext": {"authorizer": {"jwt": {"claims": {"sub": USER}}}},
+    }
+    assert handler(event, None)["statusCode"] == 400
+
+
+def test_update_profile_completes_setup(handler):
+    register(handler)
+    status, body = call(
+        handler,
+        {"runmode": "update_profile", "first_name": " Ada ", "last_name": "Lovelace", "phone": "555-0100"},
+    )
+    assert status == 200
+    assert body["user"]["first_name"] == "Ada"
+    assert body["user"]["phone"] == "555-0100"
+    assert body["user"]["profile_completed_at"] is not None
+
+
+def test_update_profile_keeps_first_completion_time(handler):
+    register(handler)
+    _, first = complete_profile(handler)
+    _, second = call(handler, {"runmode": "update_profile", "first_name": "Ada", "last_name": "King"})
+    assert second["user"]["profile_completed_at"] == first["user"]["profile_completed_at"]
+    assert second["user"]["last_name"] == "King"
+
+
+def test_update_profile_requires_names(handler):
+    register(handler)
+    status, body = call(handler, {"runmode": "update_profile", "first_name": "Ada"})
+    assert status == 400
+    assert "last_name" in body["error"]
+
+
+def test_update_profile_requires_registration(handler):
+    status, _ = complete_profile(handler)
+    assert status == 404
+
+
+def test_create_marina_links_user(handler):
+    register(handler)
+    status, body = call(handler, {
+        "runmode": "create_marina",
+        "name": "Harbourfront Marina",
+        "city": "Toronto",
+        "country": "ca",
+        "timezone": "America/Toronto",
+        "latitude": 43.6387,
+        "longitude": -79.3817,
+    })
+    assert status == 200
+    assert body["marina"]["name"] == "Harbourfront Marina"
+    assert body["marina"]["country"] == "CA"
+    assert body["marina"]["created_by"] == body["user"]["id"]
+    assert body["user"]["marina_id"] == body["marina"]["id"]
+
+
+def test_create_marina_only_once(handler):
+    register(handler)
+    assert call(handler, {"runmode": "create_marina", "name": "One"})[0] == 200
+    status, _ = call(handler, {"runmode": "create_marina", "name": "Two"})
+    assert status == 409
+
+
+@pytest.mark.parametrize("fields", [
+    {},
+    {"name": "  "},
+    {"name": "M", "country": "CAN"},
+    {"name": "M", "timezone": "Mars/Olympus"},
+    {"name": "M", "latitude": 91},
+    {"name": "M", "longitude": "west"},
+    {"name": "x" * 256},
+])
+def test_create_marina_validation(handler, fields):
+    register(handler)
+    status, _ = call(handler, {"runmode": "create_marina", **fields})
+    assert status == 400
+
+
+def test_create_marina_requires_registration(handler):
+    status, _ = call(handler, {"runmode": "create_marina", "name": "M"})
+    assert status == 404
+
+
+def test_create_marina_rolls_back_on_failure(handler, monkeypatch):
+    register(handler)
+    connection = handler.__globals__["get_connection"]()
+    real_commit = connection.commit
+
+    def failing_commit():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(connection, "commit", failing_commit)
+    with pytest.raises(RuntimeError):
+        call(handler, {"runmode": "create_marina", "name": "M"})
+    monkeypatch.setattr(connection, "commit", real_commit)
+
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT COUNT(*) AS n FROM marinas")
+        assert cursor.fetchone()["n"] == 0

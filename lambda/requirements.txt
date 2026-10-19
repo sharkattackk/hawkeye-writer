@@ -1,3 +1,4 @@
 # Runtime dependencies for the Lambda function (bundled at deploy time).
 # boto3 is already provided by the Lambda runtime.
 pymysql>=1.1
+tzdata  # timezone database for validating marina timezones
