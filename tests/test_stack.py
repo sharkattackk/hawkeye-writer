@@ -137,6 +137,38 @@ def test_no_database_by_default():
     assert "VpcConfig" not in function["Properties"]
 
 
+def _policy_actions(template):
+    actions = set()
+    for policy in template.find_resources("AWS::IAM::Policy").values():
+        for statement in policy["Properties"]["PolicyDocument"]["Statement"]:
+            action = statement["Action"]
+            actions.update(action if isinstance(action, list) else [action])
+    return actions
+
+
+def test_storage_read():
+    stack = LambdaStack(_app(), "Lambda", config=dataclasses.replace(config, storage_access="read"))
+    template = Template.from_stack(stack)
+    template.has_resource_properties(
+        "AWS::Lambda::Function",
+        {"Environment": {"Variables": Match.object_like({"IMAGERY_BUCKET": Match.any_value()})}},
+    )
+    actions = _policy_actions(template)
+    assert "s3:GetObject" in actions
+    assert "s3:PutObject" not in actions
+
+
+def test_storage_write():
+    stack = LambdaStack(_app(), "Lambda", config=dataclasses.replace(config, storage_access="write"))
+    assert {"s3:GetObject", "s3:PutObject", "s3:ListBucket"} <= _policy_actions(Template.from_stack(stack))
+
+
+def test_no_storage_by_default():
+    stack = LambdaStack(_app(), "Lambda", config=dataclasses.replace(config, storage_access="none"))
+    template = Template.from_stack(stack)
+    assert not any(a.startswith("s3:") for a in _policy_actions(template))
+
+
 def test_no_api_by_default():
     stack = LambdaStack(_app(), "Lambda", config=dataclasses.replace(config, api=None))
     Template.from_stack(stack).resource_count_is("AWS::ApiGatewayV2::Api", 0)

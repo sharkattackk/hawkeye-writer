@@ -41,6 +41,11 @@ class LambdaStack(Stack):
         )
 
         database = self._database_props(config) if config.database_user else {}
+        bucket_name = (
+            ssm.StringParameter.value_for_string_parameter(self, f"{config.database_ssm_prefix}/imagery-bucket")
+            if config.storage_access != "none"
+            else None
+        )
 
         # Installs lambda/requirements.txt into the package; code lives in lambda/handler.py
         self.function = python.PythonFunction(
@@ -57,6 +62,7 @@ class LambdaStack(Stack):
             environment={
                 "APP_NAME": config.app_name,
                 **database.get("environment", {}),
+                **({"IMAGERY_BUCKET": bucket_name} if bucket_name else {}),
                 **config.environment,
             },
             log_group=log_group,
@@ -64,6 +70,9 @@ class LambdaStack(Stack):
             vpc_subnets=database.get("vpc_subnets"),
             security_groups=database.get("security_groups"),
         )
+
+        if bucket_name:
+            self._grant_storage(bucket_name, config.storage_access)
 
         if config.database_user:
             # IAM database auth: lets the function log in as its database user
@@ -85,6 +94,16 @@ class LambdaStack(Stack):
 
         if config.api:
             self._add_api(config.app_name, config.api)
+
+    def _grant_storage(self, bucket_name: str, access: str) -> None:
+        objects = f"arn:aws:s3:::{bucket_name}/*"
+        self.function.add_to_role_policy(iam.PolicyStatement(actions=["s3:GetObject"], resources=[objects]))
+        if access == "write":
+            self.function.add_to_role_policy(iam.PolicyStatement(actions=["s3:PutObject"], resources=[objects]))
+            # Lets head_object report a missing upload as 404 rather than 403
+            self.function.add_to_role_policy(
+                iam.PolicyStatement(actions=["s3:ListBucket"], resources=[f"arn:aws:s3:::{bucket_name}"])
+            )
 
     def _database_props(self, config: Config) -> dict:
         """Look up hawkeye-database's VPC and connection details from SSM at deploy time."""

@@ -6,6 +6,8 @@ import yaml
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 
+STORAGE_ACCESS = ("none", "read", "write")
+
 
 @dataclass(frozen=True)
 class ApiConfig:
@@ -39,6 +41,7 @@ class Config:
     environment: dict = field(default_factory=dict)
     database_user: str = ""
     database_ssm_prefix: str = "/hawkeye/database"
+    storage_access: str = "none"
     api: ApiConfig | None = None
 
     @property
@@ -52,6 +55,11 @@ def load_config(path: Path = CONFIG_PATH, require_connection: bool = True) -> Co
     aws = raw.get("aws") or {}
     fn = raw.get("lambda") or {}
     db = raw.get("database") or {}
+    storage = raw.get("storage") or {}
+
+    storage_access = str(storage.get("access") or "none").strip()
+    if storage_access not in STORAGE_ACCESS:
+        raise ValueError(f"config.yaml: storage.access must be one of {', '.join(STORAGE_ACCESS)}")
 
     app_name = str(raw.get("app_name", "")).strip()
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,47}", app_name):
@@ -85,4 +93,5 @@ def load_config(path: Path = CONFIG_PATH, require_connection: bool = True) -> Co
         environment={str(k): str(v) for k, v in (fn.get("environment") or {}).items()},
         database_user=str(db.get("user") or "").strip(),
         database_ssm_prefix=str(db.get("ssm_prefix") or "/hawkeye/database").rstrip("/"),
+        storage_access=storage_access,
     )

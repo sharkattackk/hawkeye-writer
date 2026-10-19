@@ -235,3 +235,208 @@ def test_create_marina_rolls_back_on_failure(handler, monkeypatch):
     with connection.cursor() as cursor:
         cursor.execute("SELECT COUNT(*) AS n FROM marinas")
         assert cursor.fetchone()["n"] == 0
+
+
+# --- calibration
+
+class FakeStorage:
+    """Stands in for the storage module: records uploads the 'browser' made."""
+
+    def __init__(self):
+        self.objects = {}  # key -> {"size", "content_type"}
+
+    def presigned_upload(self, key, content_type, max_bytes):
+        return {"url": "https://bucket.example/", "fields": {"key": key, "Content-Type": content_type}}
+
+    def head(self, key):
+        return self.objects.get(key)
+
+
+@pytest.fixture
+def s3(handler, monkeypatch):
+    fake = FakeStorage()
+    monkeypatch.setattr(handler.__globals__["storage"], "presigned_upload", fake.presigned_upload)
+    monkeypatch.setattr(handler.__globals__["storage"], "head", fake.head)
+    return fake
+
+
+SQUARE = [[0.1, 0.1], [0.2, 0.1], [0.2, 0.2], [0.1, 0.2]]
+
+
+def setup_marina(handler, user=USER):
+    register(handler, user)
+    assert call(handler, {"runmode": "create_marina", "name": "Harbourfront"}, user)[0] == 200
+
+
+def upload_reference(handler, s3, user=USER, content_type="image/jpeg"):
+    status, body = call(handler, {"runmode": "create_image_upload", "content_type": content_type, "file_size": 1234}, user)
+    assert status == 200
+    key = body["upload"]["fields"]["key"]
+    s3.objects[key] = {"size": 1234, "content_type": content_type}
+    status, body = call(handler, {"runmode": "confirm_image", "id": body["image_id"], "width_px": 4000, "height_px": 3000}, user)
+    assert status == 200
+    return body["image"]
+
+
+def save(handler, slips, user=USER):
+    return call(handler, {"runmode": "save_slips", "slips": slips}, user)
+
+
+def test_create_image_upload(handler, s3):
+    setup_marina(handler)
+    status, body = call(handler, {"runmode": "create_image_upload", "content_type": "image/png", "file_size": 5000})
+    assert status == 200
+    key = body["upload"]["fields"]["key"]
+    assert key.startswith("marinas/1/images/") and key.endswith(".png")
+
+
+@pytest.mark.parametrize("fields", [
+    {"content_type": "image/gif", "file_size": 10},
+    {"content_type": "image/jpeg", "file_size": 0},
+    {"content_type": "image/jpeg", "file_size": 101 * 1024 * 1024},
+    {"content_type": "image/jpeg"},
+])
+def test_create_image_upload_validation(handler, s3, fields):
+    setup_marina(handler)
+    assert call(handler, {"runmode": "create_image_upload", **fields})[0] == 400
+
+
+def test_create_image_upload_requires_marina(handler, s3):
+    register(handler)
+    status, body = call(handler, {"runmode": "create_image_upload", "content_type": "image/jpeg", "file_size": 10})
+    assert status == 409
+
+
+def test_confirm_image_sets_reference(handler, s3):
+    setup_marina(handler)
+    image = upload_reference(handler, s3)
+    assert image["status"] == "uploaded"
+    assert (image["width_px"], image["height_px"]) == (4000, 3000)
+    assert register(handler)["marina"]["reference_image_id"] == image["id"]
+
+
+def test_confirm_image_before_upload(handler, s3):
+    setup_marina(handler)
+    _, body = call(handler, {"runmode": "create_image_upload", "content_type": "image/jpeg", "file_size": 10})
+    status, body = call(handler, {"runmode": "confirm_image", "id": body["image_id"], "width_px": 10, "height_px": 10})
+    assert status == 400
+    assert "uploaded" in body["error"]
+
+
+def test_confirm_image_wrong_type(handler, s3):
+    setup_marina(handler)
+    _, body = call(handler, {"runmode": "create_image_upload", "content_type": "image/jpeg", "file_size": 10})
+    s3.objects[body["upload"]["fields"]["key"]] = {"size": 10, "content_type": "text/html"}
+    status, _ = call(handler, {"runmode": "confirm_image", "id": body["image_id"], "width_px": 10, "height_px": 10})
+    assert status == 400
+
+
+def test_confirm_other_marinas_image(handler, s3):
+    setup_marina(handler)
+    image = upload_reference(handler, s3)
+    setup_marina(handler, OTHER_USER)
+    status, _ = call(handler, {"runmode": "confirm_image", "id": image["id"], "width_px": 1, "height_px": 1}, OTHER_USER)
+    assert status == 404
+
+
+def test_cannot_replace_reference_once_slips_exist(handler, s3):
+    setup_marina(handler)
+    upload_reference(handler, s3)
+    assert save(handler, [{"label": "A1", "polygon": SQUARE}])[0] == 200
+    _, body = call(handler, {"runmode": "create_image_upload", "content_type": "image/jpeg", "file_size": 10})
+    s3.objects[body["upload"]["fields"]["key"]] = {"size": 10, "content_type": "image/jpeg"}
+    status, _ = call(handler, {"runmode": "confirm_image", "id": body["image_id"], "width_px": 10, "height_px": 10})
+    assert status == 409
+
+
+def test_save_slips_creates_with_docks(handler, s3):
+    setup_marina(handler)
+    upload_reference(handler, s3)
+    status, body = save(handler, [
+        {"label": "A1", "dock": "A Dock", "polygon": SQUARE, "length_ft": 30},
+        {"label": "A2", "dock": "A Dock", "polygon": [[0.2, 0.1], [0.3, 0.1], [0.3, 0.2], [0.2, 0.2]], "kind": "t_head"},
+    ])
+    assert status == 200
+    a1, a2 = body["slips"]
+    assert a1["label"] == "A1" and a1["dock"] == "A Dock" and a1["polygon"] == SQUARE
+    assert float(a1["center_x"]) == pytest.approx(0.15) and float(a1["center_y"]) == pytest.approx(0.15)
+    assert float(a1["length_ft"]) == 30
+    assert a2["kind"] == "t_head"
+
+
+def test_save_slips_updates_deletes_and_swaps_labels(handler, s3):
+    setup_marina(handler)
+    upload_reference(handler, s3)
+    _, body = save(handler, [
+        {"label": "A1", "dock": "A Dock", "polygon": SQUARE},
+        {"label": "A2", "dock": "A Dock", "polygon": SQUARE},
+        {"label": "B1", "dock": "B Dock", "polygon": SQUARE},
+    ])
+    ids = {slip["label"]: slip["id"] for slip in body["slips"]}
+
+    # Swap A1/A2, drop B1 (and with it B Dock), add C1
+    status, body = save(handler, [
+        {"id": ids["A1"], "label": "A2", "dock": "A Dock", "polygon": SQUARE},
+        {"id": ids["A2"], "label": "A1", "dock": "A Dock", "polygon": SQUARE},
+        {"label": "C1", "polygon": SQUARE},
+    ])
+    assert status == 200
+    by_label = {slip["label"]: slip for slip in body["slips"]}
+    assert set(by_label) == {"A1", "A2", "C1"}
+    assert by_label["A2"]["id"] == ids["A1"] and by_label["A1"]["id"] == ids["A2"]
+    assert by_label["C1"]["dock"] is None
+
+    connection = handler.__globals__["get_connection"]()
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT name FROM docks")
+        assert [row["name"] for row in cursor.fetchall()] == ["A Dock"]
+
+
+def test_save_empty_list_clears_slips(handler, s3):
+    setup_marina(handler)
+    upload_reference(handler, s3)
+    save(handler, [{"label": "A1", "polygon": SQUARE}])
+    assert save(handler, []) == (200, {"slips": []})
+
+
+@pytest.mark.parametrize("slips", [
+    "nope",
+    [{"polygon": SQUARE}],
+    [{"label": "A1", "polygon": SQUARE[:3]}],
+    [{"label": "A1", "polygon": [[0.1, 0.1], [1.2, 0.1], [0.2, 0.2], [0.1, 0.2]]}],
+    [{"label": "A1", "polygon": [[0.1], [0.2, 0.1], [0.2, 0.2], [0.1, 0.2]]}],
+    [{"label": "A1", "polygon": SQUARE, "kind": "boathouse"}],
+    [{"label": "A1", "polygon": SQUARE, "length_ft": -5}],
+    [{"label": "A1", "polygon": SQUARE}, {"label": "a1", "polygon": SQUARE}],
+    [{"id": 999, "label": "A1", "polygon": SQUARE}],
+])
+def test_save_slips_validation(handler, s3, slips):
+    setup_marina(handler)
+    upload_reference(handler, s3)
+    assert save(handler, slips)[0] == 400
+
+
+def test_save_slips_requires_reference_image(handler, s3):
+    setup_marina(handler)
+    assert save(handler, [{"label": "A1", "polygon": SQUARE}])[0] == 409
+
+
+def test_cannot_edit_other_marinas_slips(handler, s3):
+    setup_marina(handler)
+    upload_reference(handler, s3)
+    _, body = save(handler, [{"label": "A1", "polygon": SQUARE}])
+    setup_marina(handler, OTHER_USER)
+    upload_reference(handler, s3, OTHER_USER)
+    status, _ = save(handler, [{"id": body["slips"][0]["id"], "label": "X", "polygon": SQUARE}], OTHER_USER)
+    assert status == 400
+
+
+def test_finish_calibration(handler, s3):
+    setup_marina(handler)
+    assert call(handler, {"runmode": "finish_calibration"})[0] == 409  # no image
+    upload_reference(handler, s3)
+    assert call(handler, {"runmode": "finish_calibration"})[0] == 409  # no slips
+    save(handler, [{"label": "A1", "polygon": SQUARE}])
+    status, body = call(handler, {"runmode": "finish_calibration"})
+    assert status == 200
+    assert body["marina"]["calibrated_at"] is not None

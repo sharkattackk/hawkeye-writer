@@ -42,7 +42,53 @@ CREATE TABLE marinas (
   email         VARCHAR(255),
   created_by    INTEGER NOT NULL REFERENCES users(id),
   created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  updated_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  reference_image_id INTEGER REFERENCES marina_images(id),
+  calibrated_at TIMESTAMP
+);
+
+CREATE TABLE marina_images (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  marina_id       INTEGER NOT NULL REFERENCES marinas(id),
+  s3_key          VARCHAR(512) NOT NULL,
+  content_type    VARCHAR(64)  NOT NULL,
+  file_size_bytes INTEGER,
+  width_px        INTEGER,
+  height_px       INTEGER,
+  captured_at     TIMESTAMP,
+  gps_latitude    DECIMAL(9,6),
+  gps_longitude   DECIMAL(9,6),
+  gps_altitude_m  DECIMAL(7,2),
+  status          TEXT NOT NULL DEFAULT 'pending_upload'
+                  CHECK (status IN ('pending_upload', 'uploaded', 'failed')),
+  homography      JSON,
+  uploaded_by     INTEGER NOT NULL REFERENCES users(id),
+  created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE docks (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  marina_id  INTEGER NOT NULL REFERENCES marinas(id),
+  name       VARCHAR(64) NOT NULL,
+  sort_order SMALLINT NOT NULL DEFAULT 0,
+  UNIQUE (marina_id, name)
+);
+
+CREATE TABLE slips (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  marina_id  INTEGER NOT NULL REFERENCES marinas(id),
+  dock_id    INTEGER REFERENCES docks(id) ON DELETE SET NULL,
+  label      VARCHAR(32) NOT NULL COLLATE NOCASE,  -- MySQL's collation is case-insensitive
+  kind       TEXT NOT NULL DEFAULT 'slip' CHECK (kind IN ('slip', 't_head', 'side_tie', 'mooring')),
+  polygon    JSON NOT NULL,
+  center_x   DECIMAL(7,6) NOT NULL,
+  center_y   DECIMAL(7,6) NOT NULL,
+  length_ft  DECIMAL(6,2),
+  width_ft   DECIMAL(6,2),
+  created_by INTEGER NOT NULL REFERENCES users(id),
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (marina_id, label)
 );
 """
 

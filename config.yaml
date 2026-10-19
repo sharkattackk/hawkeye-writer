@@ -38,3 +38,8 @@ database:
   user: hawkeye_writer
   # Where hawkeye-database publishes its connection details
   ssm_prefix: /hawkeye/database
+
+storage:
+  # Access to the hawkeye imagery bucket (from hawkeye-database): none, read or write.
+  # read = presigned view URLs; write = also presigned uploads and checking uploads.
+  access: write

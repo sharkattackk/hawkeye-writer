@@ -21,6 +21,7 @@ which is the function inside the Lambda to run.
 | `lambda/handler.py` | Your function code: add runmodes to the `RUNMODES` table |
 | `lambda/requirements.txt` | The function's pip dependencies, bundled automatically |
 | `lambda/db.py` | `get_connection()` for the hawkeye database (used when `database.user` is set) |
+| `lambda/storage.py` | Presigned upload/view URLs for the imagery bucket (used when `storage.access` is set) |
 | `app.py` | CDK entry point, plus the **API Gateway settings** (user pool, app clients, CORS origins, path) |
 | `pipeline/pipeline_stack.py` | The CodePipeline definition |
 | `pipeline/lambda_stage.py` | The stage the pipeline deploys (add more stacks here) |
@@ -130,13 +131,20 @@ Set `API = None` for a Lambda with no API, e.g. one triggered by S3 or a schedul
 **Adding a runmode:** write a function in `lambda/handler.py` and add it to `RUNMODES`:
 ```python
 def write(payload, event):
-    user_id = event["requestContext"]["authorizer"]["jwt"]["claims"]["sub"]
-    return {"message": "written", "user": user_id}
+    if not payload.get("content"):
+        raise RunmodeError(400, "content is required")
+    return {"message": "written", "user": user_id(event)}
 
 RUNMODES = {"ping": ping, "write": write}
 ```
-`payload` is the parsed request body. The signed-in user's Cognito claims are in
-`event["requestContext"]["authorizer"]["jwt"]["claims"]`.
+`payload` is the parsed request body. Helpers available in `handler.py`:
+
+- `user_id(event)` returns the signed-in user's Cognito ID (`sub`). Use it for
+  ownership; never trust a user ID sent in the request body.
+- `raise RunmodeError(status, message)` returns an error response, e.g.
+  `raise RunmodeError(404, "Item not found")` → `404 {"error": "Item not found"}`.
+- Return values can contain `datetime` and `Decimal` (as MySQL returns them).
+  Datetimes become ISO-8601 UTC strings like `2026-10-19T02:30:00Z`.
 
 ## Using the database
 
@@ -166,6 +174,20 @@ Database users and their permissions are defined in `hawkeye-database`
 > database, but not the internet or other AWS APIs such as S3 or Secrets Manager.
 > If one needs both, it needs a NAT gateway or VPC endpoint added to
 > `hawkeye-database`.
+
+## Using the imagery bucket
+
+Set `storage.access` in `config.yaml` (`read` or `write`) and push. The bucket name
+comes from `hawkeye-database`. In code:
+```python
+import storage
+
+storage.presigned_view_url("marinas/1/images/abc.jpg")          # read: URL a browser can load
+storage.presigned_upload(key, "image/jpeg", max_bytes=50_000_000)  # write: {"url", "fields"} for a browser POST
+storage.head(key)                                               # write: {"size", "content_type"} or None
+```
+Browsers upload straight to S3 with the presigned form, so large files never pass
+through the Lambda.
 
 ## Everyday changes
 
