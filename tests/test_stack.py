@@ -124,12 +124,12 @@ def _load_handler():
 def test_write_runmode():
     response = _load_handler()({"body": json.dumps({"runmode": "write"})}, None)
     assert response["statusCode"] == 200
-    assert json.loads(response["body"]) == {"message": "writer wrote"}
+    assert json.loads(response["body"]) == {"message": "writer written"}
 
 
 def test_direct_invoke():
     response = _load_handler()({"runmode": "write"}, None)
-    assert json.loads(response["body"]) == {"message": "writer wrote"}
+    assert json.loads(response["body"]) == {"message": "writer written"}
 
 
 def test_unknown_runmode():
