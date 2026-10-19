@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+cdk.out/
+cdk.context.json
+.DS_Store

@@ -1,0 +1,33 @@
+# The only file you need to edit when creating a new Lambda from this template.
+# Usually that just means changing app_name.
+
+# Names the Lambda, its stack and its pipeline. Lowercase letters, numbers and hyphens.
+app_name: lambda-cdk-template
+
+github:
+  owner: sharkattackk
+  # Leave blank to use app_name as the repo name.
+  repo: ""
+  # Pushes to this branch trigger the pipeline.
+  branch: production
+  # AWS CodeConnections ARN for GitHub (Developer Tools > Settings > Connections).
+  # One connection is shared by every repo you grant it access to.
+  connection_arn: REPLACE_WITH_CONNECTION_ARN
+
+aws:
+  account: "107489387706"
+  region: us-east-2
+
+lambda:
+  # python3.12 or python3.13
+  runtime: python3.13
+  # x86_64 or arm64. arm64 is cheaper, but bundling it on an x86 build host
+  # needs QEMU emulation, so the default is x86_64.
+  architecture: x86_64
+  memory_mb: 256
+  timeout_seconds: 30
+  log_retention_days: 30
+  # Set true to give the function a public HTTPS URL (no auth).
+  function_url: false
+  # Extra environment variables for the function.
+  environment: {}

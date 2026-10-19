@@ -1,0 +1,2 @@
+# Runtime dependencies for the Lambda function (bundled at deploy time).
+# boto3 is already provided by the Lambda runtime.
