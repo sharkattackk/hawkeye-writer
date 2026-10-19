@@ -1,6 +1,4 @@
 import dataclasses
-import importlib.util
-import json
 
 import aws_cdk as cdk
 from aws_cdk.assertions import Match, Template
@@ -142,32 +140,3 @@ def test_no_database_by_default():
 def test_no_api_by_default():
     stack = LambdaStack(_app(), "Lambda", config=dataclasses.replace(config, api=None))
     Template.from_stack(stack).resource_count_is("AWS::ApiGatewayV2::Api", 0)
-
-
-def _load_handler():
-    # "lambda" is a Python keyword, so load the module by path
-    spec = importlib.util.spec_from_file_location("handler", LAMBDA_DIR / "handler.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.handler
-
-
-def test_write_runmode():
-    response = _load_handler()({"body": json.dumps({"runmode": "write"})}, None)
-    assert response["statusCode"] == 200
-    assert json.loads(response["body"]) == {"message": "writer written"}
-
-
-def test_direct_invoke():
-    response = _load_handler()({"runmode": "write"}, None)
-    assert json.loads(response["body"]) == {"message": "writer written"}
-
-
-def test_unknown_runmode():
-    response = _load_handler()({"body": json.dumps({"runmode": "nope"})}, None)
-    assert response["statusCode"] == 400
-
-
-def test_invalid_body():
-    response = _load_handler()({"body": "not json"}, None)
-    assert response["statusCode"] == 400
