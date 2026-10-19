@@ -31,3 +31,10 @@ lambda:
   function_url: false
   # Extra environment variables for the function.
   environment: {}
+
+database:
+  # Database user this Lambda connects as, e.g. hawkeye_reader or hawkeye_writer
+  # (defined in hawkeye-database/sql/users.sql). Leave blank for no database access.
+  user: hawkeye_writer
+  # Where hawkeye-database publishes its connection details
+  ssm_prefix: /hawkeye/database

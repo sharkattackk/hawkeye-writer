@@ -37,6 +37,8 @@ class Config:
     log_retention_days: int = 30
     function_url: bool = False
     environment: dict = field(default_factory=dict)
+    database_user: str = ""
+    database_ssm_prefix: str = "/hawkeye/database"
     api: ApiConfig | None = None
 
     @property
@@ -49,6 +51,7 @@ def load_config(path: Path = CONFIG_PATH, require_connection: bool = True) -> Co
     github = raw.get("github") or {}
     aws = raw.get("aws") or {}
     fn = raw.get("lambda") or {}
+    db = raw.get("database") or {}
 
     app_name = str(raw.get("app_name", "")).strip()
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,47}", app_name):
@@ -80,4 +83,6 @@ def load_config(path: Path = CONFIG_PATH, require_connection: bool = True) -> Co
         log_retention_days=int(fn.get("log_retention_days", 30)),
         function_url=bool(fn.get("function_url", False)),
         environment={str(k): str(v) for k, v in (fn.get("environment") or {}).items()},
+        database_user=str(db.get("user") or "").strip(),
+        database_ssm_prefix=str(db.get("ssm_prefix") or "/hawkeye/database").rstrip("/"),
     )

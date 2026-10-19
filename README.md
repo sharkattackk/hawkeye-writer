@@ -6,20 +6,25 @@ builds and deploys the Lambda automatically. The pipeline also updates itself wh
 you change the pipeline code.
 
 ```
-GitHub push ──> Source ──> Build (pytest + cdk synth) ──> UpdatePipeline ──> Assets ──> Deploy Lambda
+GitHub push ──> Source ──> Build (pytest + cdk synth) ──> UpdatePipeline ──> Assets ──> Deploy Lambda + API
 ```
+
+Each Lambda gets an API Gateway endpoint ending in `/invoke`. Only users signed in
+to the configured Cognito user pool can call it. The request body picks a **runmode**,
+which is the function inside the Lambda to run.
 
 ## Layout
 
 | Path | What it is |
 | --- | --- |
 | `config.yaml` | **The file you edit:** app name, repo, branch, Lambda settings |
-| `lambda/handler.py` | Your function code (`handler(event, context)`) |
+| `lambda/handler.py` | Your function code: add runmodes to the `RUNMODES` table |
 | `lambda/requirements.txt` | The function's pip dependencies, bundled automatically |
-| `app.py` | CDK entry point |
+| `lambda/db.py` | `get_connection()` for the hawkeye database (used when `database.user` is set) |
+| `app.py` | CDK entry point, plus the **API Gateway settings** (user pool, app clients, CORS origins, path) |
 | `pipeline/pipeline_stack.py` | The CodePipeline definition |
 | `pipeline/lambda_stage.py` | The stage the pipeline deploys (add more stacks here) |
-| `pipeline/lambda_stack.py` | The Lambda function, its log group and an optional function URL |
+| `pipeline/lambda_stack.py` | The Lambda function, its log group and API Gateway |
 | `pipeline/config.py` | Loads and validates `config.yaml` |
 | `tests/` | Tests that run locally and in the pipeline before every deploy |
 
@@ -86,13 +91,89 @@ pipeline changes.
 | Lambda stack | `<app_name>` |
 | Lambda function | `<app_name>` |
 | Log group | `/aws/lambda/<app_name>` |
+| HTTP API | `<app_name>`, with the URL shown as the `ApiUrl` stack output |
+
+## Calling the Lambda
+
+`POST` to the `ApiUrl` (find it in the CloudFormation console under the `<app_name>`
+stack's Outputs) with the signed-in user's Cognito ID token:
+
+```js
+import { fetchAuthSession } from 'aws-amplify/auth'
+
+const { tokens } = await fetchAuthSession()
+const res = await fetch(API_URL, {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${tokens.idToken}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ runmode: 'ping' }),
+})
+const data = await res.json()  // { message: 'pong from <app_name>' }
+```
+
+| Response | Meaning |
+| --- | --- |
+| `200` | The runmode's return value, as JSON |
+| `400` | Unknown runmode or invalid JSON; the body lists the valid runmodes |
+| `401` | Missing, expired or wrong-pool token |
+
+**API settings** live at the top of `app.py`:
+```python
+API = ApiConfig(
+    user_pool_id="us-east-2_...",            # whose users can call it
+    user_pool_client_ids=["..."],            # which app clients' tokens are accepted
+    cors_origins=["https://your.site", "http://localhost:5173"],
+    path="/invoke",
+)
+```
+Set `API = None` for a Lambda with no API, e.g. one triggered by S3 or a schedule.
+
+**Adding a runmode:** write a function in `lambda/handler.py` and add it to `RUNMODES`:
+```python
+def write(payload, event):
+    user_id = event["requestContext"]["authorizer"]["jwt"]["claims"]["sub"]
+    return {"message": "written", "user": user_id}
+
+RUNMODES = {"ping": ping, "write": write}
+```
+`payload` is the parsed request body. The signed-in user's Cognito claims are in
+`event["requestContext"]["authorizer"]["jwt"]["claims"]`.
+
+## Using the database
+
+Set the database user in `config.yaml` and push:
+```yaml
+database:
+  user: hawkeye_reader      # or hawkeye_writer
+```
+The Lambda then runs inside the `hawkeye-database` VPC, with access to the database
+and permission to log in as that user using an IAM token, so no password is stored.
+In code:
+```python
+from db import get_connection
+
+def list_items(payload, event):
+    with get_connection().cursor() as cursor:
+        cursor.execute("SELECT id, name FROM items ORDER BY id")
+        return {"items": cursor.fetchall()}
+```
+Rows come back as dicts. Always pass values as parameters (`%s`), never with
+f-strings, to avoid SQL injection.
+
+Database users and their permissions are defined in `hawkeye-database`
+(`sql/users.sql`).
+
+> **No internet inside the VPC.** A Lambda with `database.user` set can reach the
+> database, but not the internet or other AWS APIs such as S3 or Secrets Manager.
+> If one needs both, it needs a NAT gateway or VPC endpoint added to
+> `hawkeye-database`.
 
 ## Everyday changes
 
 - **Function code:** edit `lambda/handler.py`, then push.
 - **Function dependencies:** add them to `lambda/requirements.txt`, then push.
-- **Memory, timeout, env vars, public URL:** edit the `lambda:` section of
+- **Memory, timeout, env vars:** edit the `lambda:` section of
   `config.yaml`, then push.
+- **Who can call the API, or CORS origins:** edit `API` in `app.py`, then push.
 - **Permissions or other AWS resources** (S3, DynamoDB, SQS triggers, …): add them in
   `pipeline/lambda_stack.py`, then push. For example:
   ```python

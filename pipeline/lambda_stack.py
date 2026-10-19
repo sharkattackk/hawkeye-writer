@@ -1,13 +1,16 @@
 from pathlib import Path
 
-from aws_cdk import CfnOutput, Duration, RemovalPolicy, Stack
+from aws_cdk import CfnOutput, Duration, Fn, RemovalPolicy, Stack
 from aws_cdk import aws_apigatewayv2 as apigw
 from aws_cdk import aws_apigatewayv2_authorizers as authorizers
 from aws_cdk import aws_apigatewayv2_integrations as integrations
 from aws_cdk import aws_cognito as cognito
+from aws_cdk import aws_ec2 as ec2
+from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_lambda_python_alpha as python
 from aws_cdk import aws_logs as logs
+from aws_cdk import aws_ssm as ssm
 from constructs import Construct
 
 from pipeline.config import ApiConfig, Config
@@ -37,6 +40,8 @@ class LambdaStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
+        database = self._database_props(config) if config.database_user else {}
+
         # Installs lambda/requirements.txt into the package; code lives in lambda/handler.py
         self.function = python.PythonFunction(
             self,
@@ -49,9 +54,28 @@ class LambdaStack(Stack):
             architecture=ARCHITECTURES[config.architecture],
             memory_size=config.memory_mb,
             timeout=Duration.seconds(config.timeout_seconds),
-            environment={"APP_NAME": config.app_name, **config.environment},
+            environment={
+                "APP_NAME": config.app_name,
+                **database.get("environment", {}),
+                **config.environment,
+            },
             log_group=log_group,
+            vpc=database.get("vpc"),
+            vpc_subnets=database.get("vpc_subnets"),
+            security_groups=database.get("security_groups"),
         )
+
+        if config.database_user:
+            # IAM database auth: lets the function log in as its database user
+            self.function.add_to_role_policy(
+                iam.PolicyStatement(
+                    actions=["rds-db:connect"],
+                    resources=[
+                        f"arn:aws:rds-db:{self.region}:{self.account}:dbuser:"
+                        f"{database['resource_id']}/{config.database_user}"
+                    ],
+                )
+            )
 
         CfnOutput(self, "FunctionName", value=self.function.function_name)
 
@@ -61,6 +85,37 @@ class LambdaStack(Stack):
 
         if config.api:
             self._add_api(config.app_name, config.api)
+
+    def _database_props(self, config: Config) -> dict:
+        """Look up hawkeye-database's VPC and connection details from SSM at deploy time."""
+
+        def param(name: str) -> str:
+            return ssm.StringParameter.value_for_string_parameter(self, f"{config.database_ssm_prefix}/{name}")
+
+        vpc = ec2.Vpc.from_vpc_attributes(
+            self,
+            "DatabaseVpc",
+            vpc_id=param("vpc-id"),
+            availability_zones=Fn.split(",", param("availability-zones"), 2),
+            isolated_subnet_ids=Fn.split(",", param("lambda-subnet-ids"), 2),
+        )
+
+        return {
+            "vpc": vpc,
+            "vpc_subnets": ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+            "security_groups": [
+                ec2.SecurityGroup.from_security_group_id(
+                    self, "DatabaseClientSecurityGroup", param("client-security-group-id")
+                )
+            ],
+            "environment": {
+                "DB_HOST": param("host"),
+                "DB_PORT": param("port"),
+                "DB_NAME": param("name"),
+                "DB_USER": config.database_user,
+            },
+            "resource_id": param("resource-id"),
+        }
 
     def _add_api(self, app_name: str, api_config: ApiConfig) -> None:
         user_pool = cognito.UserPool.from_user_pool_id(self, "UserPool", api_config.user_pool_id)

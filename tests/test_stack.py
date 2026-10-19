@@ -108,6 +108,37 @@ def test_api():
     )
 
 
+def test_database_access():
+    stack = LambdaStack(_app(), "Lambda", config=dataclasses.replace(config, database_user="hawkeye_reader"))
+    template = Template.from_stack(stack)
+
+    template.has_resource_properties(
+        "AWS::Lambda::Function",
+        {
+            "VpcConfig": Match.object_like({"SubnetIds": Match.any_value(), "SecurityGroupIds": Match.any_value()}),
+            "Environment": {
+                "Variables": Match.object_like({"DB_USER": "hawkeye_reader", "DB_HOST": Match.any_value()}),
+            },
+        },
+    )
+    template.has_resource_properties(
+        "AWS::IAM::Policy",
+        {
+            "PolicyDocument": {
+                "Statement": Match.array_with([
+                    Match.object_like({"Action": "rds-db:connect"}),
+                ]),
+            },
+        },
+    )
+
+
+def test_no_database_by_default():
+    stack = LambdaStack(_app(), "Lambda", config=dataclasses.replace(config, database_user=""))
+    function = next(iter(Template.from_stack(stack).find_resources("AWS::Lambda::Function").values()))
+    assert "VpcConfig" not in function["Properties"]
+
+
 def test_no_api_by_default():
     stack = LambdaStack(_app(), "Lambda", config=dataclasses.replace(config, api=None))
     Template.from_stack(stack).resource_count_is("AWS::ApiGatewayV2::Api", 0)
