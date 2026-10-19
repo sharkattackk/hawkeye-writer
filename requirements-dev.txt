@@ -1,1 +1,4 @@
 pytest>=8.0
+# So tests can import the Lambda code
+-r lambda/requirements.txt
+boto3
