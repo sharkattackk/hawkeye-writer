@@ -3,7 +3,7 @@ import json
 
 
 def write(payload, event):
-    return {"message": "writer wrote"}
+    return {"message": "writer written"}
 
 
 # runmode -> function(payload, event). Add new runmodes here.
