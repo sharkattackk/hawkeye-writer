@@ -43,6 +43,7 @@ CREATE TABLE marina_images (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   marina_id       INTEGER NOT NULL REFERENCES marinas(id),
   s3_key          VARCHAR(512) NOT NULL,
+  annotated_s3_key VARCHAR(512),
   content_type    VARCHAR(64)  NOT NULL,
   file_size_bytes INTEGER,
   width_px        INTEGER,
