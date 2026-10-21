@@ -454,3 +454,24 @@ def test_retry_other_marinas_job(handler, s3):
     setup_marina(handler, OTHER_USER)
     status, _ = call(handler, {"runmode": "retry_analysis", "image_id": body["image"]["id"]}, OTHER_USER)
     assert status == 404
+
+
+def test_editing_calibration_keeps_past_results(handler, s3):
+    calibrate(handler, s3)  # one slip, A1
+    _, body = upload_update(handler, s3)
+    connection = handler.__globals__["get_connection"]()
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT id FROM slips"); slip_id = cursor.fetchone()["id"]
+        cursor.execute(
+            "INSERT INTO slip_observations (job_id, image_id, slip_id, label, occupied, observed_at) "
+            "VALUES (%s, %s, %s, 'A1', 1, CURRENT_TIMESTAMP)",
+            (body["job"]["id"], body["image"]["id"], slip_id),
+        )
+
+    # Recalibrate after the photo was analyzed: drop A1, add two new slips
+    status, saved = save(handler, [{"label": "B1", "polygon": SQUARE}, {"label": "B2", "polygon": SQUARE}])
+    assert status == 200 and [s["label"] for s in saved["slips"]] == ["B1", "B2"]
+
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT slip_id, label, occupied FROM slip_observations")
+        assert cursor.fetchall() == [{"slip_id": None, "label": "A1", "occupied": 1}]
