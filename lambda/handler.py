@@ -12,43 +12,6 @@ import pymysql
 import storage
 from db import get_connection
 
-MAX_CONTENT_LENGTH = 255  # test_items.content is VARCHAR(255)
-
-
-def write(payload, event):
-    return {"message": "writer written"}
-
-
-def create_item(payload, event):
-    """{"runmode": "create_item", "content": "..."} -> {"item": {...}}"""
-    content = _content(payload)
-    with get_connection().cursor() as cursor:
-        cursor.execute(
-            "INSERT INTO test_items (content, created_by) VALUES (%s, %s)",
-            (content, user_id(event)),
-        )
-        return {"item": _get_item(cursor, cursor.lastrowid)}
-
-
-def update_item(payload, event):
-    """{"runmode": "update_item", "id": 1, "content": "..."} -> {"item": {...}}"""
-    item_id = _item_id(payload)
-    content = _content(payload)
-    with get_connection().cursor() as cursor:
-        _get_own_item(cursor, item_id, user_id(event))
-        cursor.execute("UPDATE test_items SET content = %s WHERE id = %s", (content, item_id))
-        return {"item": _get_item(cursor, item_id)}
-
-
-def delete_item(payload, event):
-    """{"runmode": "delete_item", "id": 1} -> {"deleted": 1}"""
-    item_id = _item_id(payload)
-    with get_connection().cursor() as cursor:
-        _get_own_item(cursor, item_id, user_id(event))
-        cursor.execute("DELETE FROM test_items WHERE id = %s", (item_id,))
-    return {"deleted": item_id}
-
-
 def register_user(payload, event):
     """Create the caller's users row on first login (safe to repeat) -> {"user", "marina"}"""
     sub = user_id(event)
@@ -302,10 +265,6 @@ def finish_calibration(payload, event):
 
 # runmode -> function(payload, event). Add new runmodes here.
 RUNMODES = {
-    "write": write,
-    "create_item": create_item,
-    "update_item": update_item,
-    "delete_item": delete_item,
     "register_user": register_user,
     "update_profile": update_profile,
     "create_marina": create_marina,
@@ -517,40 +476,8 @@ def _coordinate(payload, field, limit):
     return round(float(value), 6)
 
 
-def _content(payload):
-    content = payload.get("content")
-    if not isinstance(content, str) or not content.strip():
-        raise RunmodeError(400, "content must be a non-empty string")
-    content = content.strip()
-    if len(content) > MAX_CONTENT_LENGTH:
-        raise RunmodeError(400, f"content must be at most {MAX_CONTENT_LENGTH} characters")
-    return content
-
-
-def _item_id(payload):
-    return _positive_int(payload, "id")
-
-
-def _get_item(cursor, item_id):
-    cursor.execute(
-        "SELECT id, content, created_by, created_at, updated_at FROM test_items WHERE id = %s",
-        (item_id,),
-    )
-    return cursor.fetchone()
-
-
-def _get_own_item(cursor, item_id, owner):
-    """Users may only change their own items."""
-    item = _get_item(cursor, item_id)
-    if item is None:
-        raise RunmodeError(404, "Item not found")
-    if item["created_by"] != owner:
-        raise RunmodeError(403, "You can only change your own items")
-    return item
-
-
 def handler(event, context):
-    """Entry point. Expects a JSON body like {"runmode": "write", ...}."""
+    """Entry point. Expects a JSON body like {"runmode": "register_user", ...}."""
     try:
         payload = _parse_body(event)
     except ValueError:

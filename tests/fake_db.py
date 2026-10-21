@@ -5,14 +5,6 @@ import pymysql
 
 # Mirrors hawkeye-database/sql/, in SQLite syntax
 SCHEMA = """
-CREATE TABLE test_items (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  content    VARCHAR(255) NOT NULL,
-  created_by VARCHAR(64)  NOT NULL,
-  created_at TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
 CREATE TABLE users (
   id                   INTEGER PRIMARY KEY AUTOINCREMENT,
   cognito_sub          VARCHAR(64)  NOT NULL UNIQUE,
