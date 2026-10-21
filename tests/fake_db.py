@@ -108,8 +108,10 @@ CREATE TABLE slip_observations (
   dock        VARCHAR(64),
   kind        TEXT,
   polygon     JSON,
+  crop_s3_key VARCHAR(512),
   occupied    BOOLEAN NOT NULL,
   confidence  DECIMAL(4,3),
+  model_version VARCHAR(64),
   observed_at TIMESTAMP NOT NULL,
   UNIQUE (image_id, slip_id)
 );
