@@ -82,6 +82,32 @@ CREATE TABLE slips (
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (marina_id, label)
 );
+
+CREATE TABLE analysis_jobs (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  marina_id    INTEGER NOT NULL REFERENCES marinas(id),
+  image_id     INTEGER NOT NULL UNIQUE REFERENCES marina_images(id),
+  status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded', 'failed')),
+  progress     INTEGER,
+  message      VARCHAR(255),
+  worker_id    VARCHAR(64),
+  attempts     INTEGER NOT NULL DEFAULT 0,
+  queued_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  started_at   TIMESTAMP,
+  heartbeat_at TIMESTAMP,
+  finished_at  TIMESTAMP
+);
+
+CREATE TABLE slip_observations (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id      INTEGER NOT NULL REFERENCES analysis_jobs(id),
+  image_id    INTEGER NOT NULL REFERENCES marina_images(id),
+  slip_id     INTEGER NOT NULL REFERENCES slips(id) ON DELETE CASCADE,
+  occupied    BOOLEAN NOT NULL,
+  confidence  DECIMAL(4,3),
+  observed_at TIMESTAMP NOT NULL,
+  UNIQUE (image_id, slip_id)
+);
 """
 
 

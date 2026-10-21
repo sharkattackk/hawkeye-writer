@@ -375,3 +375,82 @@ def test_finish_calibration(handler, s3):
     status, body = call(handler, {"runmode": "finish_calibration"})
     assert status == 200
     assert body["marina"]["calibrated_at"] is not None
+
+
+# --- drone updates
+
+def calibrate(handler, s3, user=USER):
+    setup_marina(handler, user)
+    upload_reference(handler, s3, user)
+    save(handler, [{"label": "A1", "polygon": SQUARE}], user)
+    assert call(handler, {"runmode": "finish_calibration"}, user)[0] == 200
+
+
+def upload_update(handler, s3, user=USER):
+    _, body = call(handler, {"runmode": "create_image_upload", "content_type": "image/jpeg", "file_size": 99}, user)
+    s3.objects[body["upload"]["fields"]["key"]] = {"size": 99, "content_type": "image/jpeg"}
+    return call(
+        handler,
+        {"runmode": "confirm_image", "id": body["image_id"], "width_px": 4000, "height_px": 3000, "set_reference": False},
+        user,
+    )
+
+
+def test_update_queues_analysis_job(handler, s3):
+    calibrate(handler, s3)
+    status, body = upload_update(handler, s3)
+    assert status == 200
+    assert body["job"]["status"] == "pending"
+    assert body["job"]["image_id"] == body["image"]["id"]
+    # the reference image is unchanged
+    assert register(handler)["marina"]["reference_image_id"] != body["image"]["id"]
+
+
+def test_confirming_update_twice_queues_once(handler, s3):
+    calibrate(handler, s3)
+    _, body = upload_update(handler, s3)
+    image_id = body["image"]["id"]
+    again = call(handler, {"runmode": "confirm_image", "id": image_id, "width_px": 1, "height_px": 1, "set_reference": False})
+    assert again[0] == 200 and again[1]["job"]["id"] == body["job"]["id"]
+    connection = handler.__globals__["get_connection"]()
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT COUNT(*) AS n FROM analysis_jobs")
+        assert cursor.fetchone()["n"] == 1
+
+
+def test_update_requires_calibration(handler, s3):
+    setup_marina(handler)
+    upload_reference(handler, s3)
+    status, body = upload_update(handler, s3)
+    assert status == 409
+    assert "Calibrate" in body["error"]
+
+
+def test_reference_upload_has_no_job(handler, s3):
+    setup_marina(handler)
+    _, body = call(handler, {"runmode": "create_image_upload", "content_type": "image/jpeg", "file_size": 9})
+    s3.objects[body["upload"]["fields"]["key"]] = {"size": 9, "content_type": "image/jpeg"}
+    status, body = call(handler, {"runmode": "confirm_image", "id": body["image_id"], "width_px": 1, "height_px": 1})
+    assert status == 200 and body["job"] is None
+
+
+def test_retry_failed_analysis(handler, s3):
+    calibrate(handler, s3)
+    _, body = upload_update(handler, s3)
+    image_id = body["image"]["id"]
+    assert call(handler, {"runmode": "retry_analysis", "image_id": image_id})[0] == 409  # still pending
+
+    connection = handler.__globals__["get_connection"]()
+    with connection.cursor() as cursor:
+        cursor.execute("UPDATE analysis_jobs SET status = 'failed', message = 'boom', progress = 40")
+    status, body = call(handler, {"runmode": "retry_analysis", "image_id": image_id})
+    assert status == 200
+    assert body["job"]["status"] == "pending" and body["job"]["message"] is None
+
+
+def test_retry_other_marinas_job(handler, s3):
+    calibrate(handler, s3)
+    _, body = upload_update(handler, s3)
+    setup_marina(handler, OTHER_USER)
+    status, _ = call(handler, {"runmode": "retry_analysis", "image_id": body["image"]["id"]}, OTHER_USER)
+    assert status == 404

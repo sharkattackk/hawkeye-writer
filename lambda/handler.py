@@ -127,10 +127,13 @@ def create_image_upload(payload, event):
 
 
 def confirm_image(payload, event):
-    """{"id", "width_px", "height_px", "set_reference"?: true} -> {"image"}
+    """{"id", "width_px", "height_px", "set_reference"?: true} -> {"image", "job"}
 
-    Checks the file reached S3, records its size and dimensions, and by default makes it
-    the marina's reference image (the coordinate frame for slip polygons).
+    Checks the file reached S3 and records its size and dimensions. Then either:
+    - set_reference true (default): makes it the marina's reference image, the
+      coordinate frame for slip polygons (calibration); job is None.
+    - set_reference false: treats it as a drone update of a calibrated marina and
+      queues an analysis job for hawkeye-worker; job is the new job.
     """
     image_id = _positive_int(payload, "id")
     width_px = _positive_int(payload, "width_px")
@@ -140,7 +143,19 @@ def confirm_image(payload, event):
     connection = get_connection()
     with connection.cursor() as cursor:
         user = _require_marina_user(cursor, user_id(event))
-        image = _get_image(cursor, image_id, user["marina_id"])
+        marina_id = user["marina_id"]
+        image = _get_image(cursor, image_id, marina_id)
+        marina = _get_marina(cursor, marina_id)
+
+        if set_reference:
+            if marina["reference_image_id"] not in (None, image_id) and _slip_count(cursor, marina_id):
+                # Slip polygons are relative to the current reference image
+                raise RunmodeError(409, "Slips are already labelled on another reference image")
+        else:
+            if marina["calibrated_at"] is None:
+                raise RunmodeError(409, "Calibrate your marina before uploading drone updates")
+            if image_id == marina["reference_image_id"]:
+                raise RunmodeError(409, "That is the reference image")
 
         uploaded = storage.head(image["s3_key"])
         if uploaded is None:
@@ -149,21 +164,48 @@ def confirm_image(payload, event):
             cursor.execute("UPDATE marina_images SET status = 'failed' WHERE id = %s", (image_id,))
             raise RunmodeError(400, "Uploaded file type doesn't match")
 
-        if set_reference:
-            marina = _get_marina(cursor, user["marina_id"])
-            if marina["reference_image_id"] not in (None, image_id) and _slip_count(cursor, user["marina_id"]):
-                # Slip polygons are relative to the current reference image
-                raise RunmodeError(409, "Slips are already labelled on another reference image")
+        connection.begin()
+        try:
+            cursor.execute(
+                "UPDATE marina_images SET status = 'uploaded', file_size_bytes = %s, width_px = %s, height_px = %s "
+                "WHERE id = %s",
+                (uploaded["size"], width_px, height_px, image_id),
+            )
+            if set_reference:
+                cursor.execute("UPDATE marinas SET reference_image_id = %s WHERE id = %s", (image_id, marina_id))
+            elif _get_job(cursor, image_id) is None:  # confirming twice must not queue twice
+                cursor.execute(
+                    "INSERT INTO analysis_jobs (marina_id, image_id) VALUES (%s, %s)", (marina_id, image_id)
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
 
+        return {
+            "image": _get_image(cursor, image_id, marina_id),
+            "job": None if set_reference else _get_job(cursor, image_id),
+        }
+
+
+def retry_analysis(payload, event):
+    """{"image_id"} -> {"job"}. Puts a failed analysis job back in the queue."""
+    image_id = _positive_int(payload, "image_id")
+    with get_connection().cursor() as cursor:
+        user = _require_marina_user(cursor, user_id(event))
+        _get_image(cursor, image_id, user["marina_id"])  # 404 unless it's this marina's
+        job = _get_job(cursor, image_id)
+        if job is None:
+            raise RunmodeError(404, "No analysis job for that image")
+        if job["status"] != "failed":
+            raise RunmodeError(409, f"Only failed jobs can be retried (this one is {job['status']})")
         cursor.execute(
-            "UPDATE marina_images SET status = 'uploaded', file_size_bytes = %s, width_px = %s, height_px = %s "
+            "UPDATE analysis_jobs SET status = 'pending', progress = NULL, message = NULL, worker_id = NULL, "
+            "queued_at = CURRENT_TIMESTAMP, started_at = NULL, heartbeat_at = NULL, finished_at = NULL "
             "WHERE id = %s",
-            (uploaded["size"], width_px, height_px, image_id),
+            (job["id"],),
         )
-        if set_reference:
-            cursor.execute("UPDATE marinas SET reference_image_id = %s WHERE id = %s", (image_id, user["marina_id"]))
-
-        return {"image": _get_image(cursor, image_id, user["marina_id"])}
+        return {"job": _get_job(cursor, image_id)}
 
 
 def save_slips(payload, event):
@@ -272,6 +314,7 @@ RUNMODES = {
     "confirm_image": confirm_image,
     "save_slips": save_slips,
     "finish_calibration": finish_calibration,
+    "retry_analysis": retry_analysis,
 }
 
 
@@ -318,6 +361,14 @@ def _get_image(cursor, image_id, marina_id):
     if image is None:
         raise RunmodeError(404, "Image not found")
     return image
+
+
+JOB_COLUMNS = "id, image_id, status, progress, message, attempts, queued_at, started_at, finished_at"
+
+
+def _get_job(cursor, image_id):
+    cursor.execute(f"SELECT {JOB_COLUMNS} FROM analysis_jobs WHERE image_id = %s", (image_id,))
+    return cursor.fetchone()
 
 
 def _slip_count(cursor, marina_id):
