@@ -113,6 +113,20 @@ CREATE TABLE slip_observations (
   observed_at TIMESTAMP NOT NULL,
   UNIQUE (image_id, slip_id)
 );
+
+CREATE TABLE analysis_job_steps (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id      INTEGER NOT NULL REFERENCES analysis_jobs(id) ON DELETE CASCADE,
+  attempt     INTEGER NOT NULL,
+  step        VARCHAR(32) NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'succeeded', 'failed')),
+  started_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  finished_at TIMESTAMP,
+  message     VARCHAR(255),
+  detail      JSON,
+  artifacts   JSON,
+  UNIQUE (job_id, attempt, step)
+);
 """
 
 
