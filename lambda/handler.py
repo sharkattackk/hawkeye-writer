@@ -305,6 +305,92 @@ def finish_calibration(payload, event):
         return _get_account(cursor, sub)
 
 
+LABELS = ("boat", "empty", "unclear")
+
+
+def label_slip(payload, event):
+    """{"image_id", "slip_id", "label": "boat" | "empty" | "unclear"} -> {"status", "labels"}
+
+    A person's answer to "is this correct?" for one slip in one analyzed photo. Saved as
+    a training example (with the crop the model saw and its original guess), and a
+    boat/empty answer also corrects that photo's result. Answering again changes it.
+    """
+    image_id = _positive_int(payload, "image_id")
+    slip_id = _positive_int(payload, "slip_id")
+    label = payload.get("label")
+    if label not in LABELS:
+        raise RunmodeError(400, f"label must be one of {', '.join(LABELS)}")
+
+    connection = get_connection()
+    with connection.cursor() as cursor:
+        user = _require_marina_user(cursor, user_id(event))
+        cursor.execute(
+            "SELECT o.id, o.occupied, o.confidence, o.model_version, o.crop_s3_key FROM slip_observations o "
+            "JOIN marina_images i ON i.id = o.image_id "
+            "WHERE o.image_id = %s AND o.slip_id = %s AND i.marina_id = %s",
+            (image_id, slip_id, user["marina_id"]),
+        )
+        observation = cursor.fetchone()
+        if observation is None:
+            raise RunmodeError(404, "No result for that slip in that photo")
+
+        cursor.execute("SELECT id FROM slip_labels WHERE image_id = %s AND slip_id = %s", (image_id, slip_id))
+        existing = cursor.fetchone()
+
+        connection.begin()
+        try:
+            if existing:
+                # Keep the model's original guess from the first answer
+                cursor.execute(
+                    "UPDATE slip_labels SET label = %s, labeled_by = %s WHERE id = %s",
+                    (label, user["id"], existing["id"]),
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO slip_labels (marina_id, image_id, slip_id, label, crop_s3_key, predicted_occupied, "
+                    "predicted_confidence, model_version, labeled_by) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        user["marina_id"], image_id, slip_id, label, observation["crop_s3_key"],
+                        observation["occupied"], observation["confidence"], observation["model_version"], user["id"],
+                    ),
+                )
+            if label != "unclear":
+                cursor.execute(
+                    "UPDATE slip_observations SET occupied = %s, confidence = 1.0 WHERE id = %s",
+                    (label == "boat", observation["id"]),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+        cursor.execute("SELECT occupied, confidence FROM slip_observations WHERE id = %s", (observation["id"],))
+        status = cursor.fetchone()
+        return {
+            "status": {"occupied": bool(status["occupied"]), "confidence": status["confidence"], "label": label},
+            "labels": label_stats(cursor, user["marina_id"]),
+        }
+
+
+def label_stats(cursor, marina_id):
+    """How big the training set is, and how often the model's guess matched the answer."""
+    cursor.execute(
+        "SELECT COUNT(*) AS total, "
+        "COALESCE(SUM(CASE WHEN label <> 'unclear' THEN 1 ELSE 0 END), 0) AS decided, "
+        "COALESCE(SUM(CASE WHEN label <> 'unclear' AND predicted_occupied = (label = 'boat') THEN 1 ELSE 0 END), 0) AS agreed "
+        "FROM slip_labels WHERE marina_id = %s",
+        (marina_id,),
+    )
+    row = cursor.fetchone()
+    decided = int(row["decided"])
+    return {
+        "total": int(row["total"]),
+        "decided": decided,
+        "agreed": int(row["agreed"]),
+        "accuracy": round(int(row["agreed"]) / decided, 3) if decided else None,
+    }
+
+
 # runmode -> function(payload, event). Add new runmodes here.
 RUNMODES = {
     "register_user": register_user,
@@ -315,6 +401,7 @@ RUNMODES = {
     "save_slips": save_slips,
     "finish_calibration": finish_calibration,
     "retry_analysis": retry_analysis,
+    "label_slip": label_slip,
 }
 
 

@@ -475,3 +475,75 @@ def test_editing_calibration_keeps_past_results(handler, s3):
     with connection.cursor() as cursor:
         cursor.execute("SELECT slip_id, label, occupied FROM slip_observations")
         assert cursor.fetchall() == [{"slip_id": None, "label": "A1", "occupied": 1}]
+
+
+# --- labelling
+
+def analyzed_slip(handler, s3, occupied=True, confidence=0.6):
+    """A calibrated marina with one analyzed update; returns (image_id, slip_id)."""
+    calibrate(handler, s3)
+    _, body = upload_update(handler, s3)
+    connection = handler.__globals__["get_connection"]()
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT id FROM slips"); slip_id = cursor.fetchone()["id"]
+        cursor.execute(
+            "INSERT INTO slip_observations (job_id, image_id, slip_id, label, occupied, confidence, model_version, "
+            "crop_s3_key, observed_at) VALUES (%s, %s, %s, 'A1', %s, %s, 'clip-zeroshot-v1', 'crops/1.jpg', CURRENT_TIMESTAMP)",
+            (body["job"]["id"], body["image"]["id"], slip_id, occupied, confidence),
+        )
+    return body["image"]["id"], slip_id
+
+
+def label(handler, image_id, slip_id, value, user=USER):
+    return call(handler, {"runmode": "label_slip", "image_id": image_id, "slip_id": slip_id, "label": value}, user)
+
+
+def test_label_corrects_the_result_and_keeps_the_guess(handler, s3):
+    image_id, slip_id = analyzed_slip(handler, s3, occupied=True, confidence=0.6)
+    status, body = label(handler, image_id, slip_id, "empty")
+    assert status == 200
+    assert body["status"] == {"occupied": False, "confidence": 1.0, "label": "empty"}
+    assert body["labels"] == {"total": 1, "decided": 1, "agreed": 0, "accuracy": 0.0}
+
+    connection = handler.__globals__["get_connection"]()
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT label, predicted_occupied, predicted_confidence, model_version, crop_s3_key FROM slip_labels")
+        row = cursor.fetchone()
+    assert row["label"] == "empty" and row["predicted_occupied"] == 1 and float(row["predicted_confidence"]) == 0.6
+    assert row["model_version"] == "clip-zeroshot-v1" and row["crop_s3_key"] == "crops/1.jpg"
+
+
+def test_changing_an_answer_keeps_the_original_guess(handler, s3):
+    image_id, slip_id = analyzed_slip(handler, s3, occupied=True, confidence=0.6)
+    label(handler, image_id, slip_id, "empty")
+    status, body = label(handler, image_id, slip_id, "boat")  # changed my mind
+    assert status == 200 and body["status"]["occupied"] is True
+    assert body["labels"] == {"total": 1, "decided": 1, "agreed": 1, "accuracy": 1.0}  # model guessed boat
+
+
+def test_unclear_keeps_the_prediction(handler, s3):
+    image_id, slip_id = analyzed_slip(handler, s3, occupied=True, confidence=0.6)
+    status, body = label(handler, image_id, slip_id, "unclear")
+    assert body["status"] == {"occupied": True, "confidence": 0.6, "label": "unclear"}
+    assert body["labels"]["decided"] == 0 and body["labels"]["accuracy"] is None
+
+
+@pytest.mark.parametrize("fields", [
+    {"label": "maybe"},
+    {"label": "boat", "image_id": "x"},
+])
+def test_label_validation(handler, s3, fields):
+    image_id, slip_id = analyzed_slip(handler, s3)
+    payload = {"runmode": "label_slip", "image_id": image_id, "slip_id": slip_id, **fields}
+    assert call(handler, payload)[0] == 400
+
+
+def test_cannot_label_another_marinas_photo(handler, s3):
+    image_id, slip_id = analyzed_slip(handler, s3)
+    setup_marina(handler, OTHER_USER)
+    assert label(handler, image_id, slip_id, "boat", OTHER_USER)[0] == 404
+
+
+def test_label_requires_a_result(handler, s3):
+    image_id, slip_id = analyzed_slip(handler, s3)
+    assert label(handler, image_id, slip_id + 99, "boat")[0] == 404

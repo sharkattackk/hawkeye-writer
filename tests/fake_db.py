@@ -129,6 +129,22 @@ CREATE TABLE analysis_job_steps (
   artifacts   JSON,
   UNIQUE (job_id, attempt, step)
 );
+
+CREATE TABLE slip_labels (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  marina_id            INTEGER NOT NULL REFERENCES marinas(id),
+  image_id             INTEGER NOT NULL REFERENCES marina_images(id),
+  slip_id              INTEGER REFERENCES slips(id) ON DELETE SET NULL,
+  label                TEXT NOT NULL CHECK (label IN ('boat', 'empty', 'unclear')),
+  crop_s3_key          VARCHAR(512),
+  predicted_occupied   BOOLEAN,
+  predicted_confidence DECIMAL(4,3),
+  model_version        VARCHAR(64),
+  labeled_by           INTEGER NOT NULL REFERENCES users(id),
+  created_at           TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at           TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (image_id, slip_id)
+);
 """
 
 
