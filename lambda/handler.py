@@ -372,12 +372,46 @@ def label_slip(payload, event):
         }
 
 
+def remove_label(payload, event):
+    """{"label_id"} -> {"labels"}. Deletes a label (e.g. a misclick) and puts the model's
+    original result back for that slip in that photo."""
+    label_id = _positive_int(payload, "label_id")
+    connection = get_connection()
+    with connection.cursor() as cursor:
+        user = _require_marina_user(cursor, user_id(event))
+        cursor.execute(
+            "SELECT id, image_id, slip_id, label, predicted_occupied, predicted_confidence FROM slip_labels "
+            "WHERE id = %s AND marina_id = %s",
+            (label_id, user["marina_id"]),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise RunmodeError(404, "Label not found")
+
+        connection.begin()
+        try:
+            if row["slip_id"] is not None and row["label"] != "unclear" and row["predicted_occupied"] is not None:
+                cursor.execute(
+                    "UPDATE slip_observations SET occupied = %s, confidence = %s WHERE image_id = %s AND slip_id = %s",
+                    (row["predicted_occupied"], row["predicted_confidence"], row["image_id"], row["slip_id"]),
+                )
+            cursor.execute("DELETE FROM slip_labels WHERE id = %s", (label_id,))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return {"labels": label_stats(cursor, user["marina_id"])}
+
+
 def label_stats(cursor, marina_id):
     """How big the training set is, and how often the model's guess matched the answer."""
     cursor.execute(
         "SELECT COUNT(*) AS total, "
         "COALESCE(SUM(CASE WHEN label <> 'unclear' THEN 1 ELSE 0 END), 0) AS decided, "
-        "COALESCE(SUM(CASE WHEN label <> 'unclear' AND predicted_occupied = (label = 'boat') THEN 1 ELSE 0 END), 0) AS agreed "
+        "COALESCE(SUM(CASE WHEN label <> 'unclear' AND predicted_occupied = (label = 'boat') THEN 1 ELSE 0 END), 0) AS agreed, "
+        "COALESCE(SUM(CASE WHEN label = 'boat' THEN 1 ELSE 0 END), 0) AS boat, "
+        "COALESCE(SUM(CASE WHEN label = 'empty' THEN 1 ELSE 0 END), 0) AS empty, "
+        "COALESCE(SUM(CASE WHEN label = 'unclear' THEN 1 ELSE 0 END), 0) AS unclear "
         "FROM slip_labels WHERE marina_id = %s",
         (marina_id,),
     )
@@ -388,6 +422,7 @@ def label_stats(cursor, marina_id):
         "decided": decided,
         "agreed": int(row["agreed"]),
         "accuracy": round(int(row["agreed"]) / decided, 3) if decided else None,
+        "by_label": {"boat": int(row["boat"]), "empty": int(row["empty"]), "unclear": int(row["unclear"])},
     }
 
 
@@ -402,6 +437,7 @@ RUNMODES = {
     "finish_calibration": finish_calibration,
     "retry_analysis": retry_analysis,
     "label_slip": label_slip,
+    "remove_label": remove_label,
 }
 
 

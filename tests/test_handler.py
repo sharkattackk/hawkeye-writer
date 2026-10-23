@@ -503,7 +503,9 @@ def test_label_corrects_the_result_and_keeps_the_guess(handler, s3):
     status, body = label(handler, image_id, slip_id, "empty")
     assert status == 200
     assert body["status"] == {"occupied": False, "confidence": 1.0, "label": "empty"}
-    assert body["labels"] == {"total": 1, "decided": 1, "agreed": 0, "accuracy": 0.0}
+    assert body["labels"] == {
+        "total": 1, "decided": 1, "agreed": 0, "accuracy": 0.0, "by_label": {"boat": 0, "empty": 1, "unclear": 0},
+    }
 
     connection = handler.__globals__["get_connection"]()
     with connection.cursor() as cursor:
@@ -518,7 +520,7 @@ def test_changing_an_answer_keeps_the_original_guess(handler, s3):
     label(handler, image_id, slip_id, "empty")
     status, body = label(handler, image_id, slip_id, "boat")  # changed my mind
     assert status == 200 and body["status"]["occupied"] is True
-    assert body["labels"] == {"total": 1, "decided": 1, "agreed": 1, "accuracy": 1.0}  # model guessed boat
+    assert body["labels"]["accuracy"] == 1.0 and body["labels"]["by_label"]["boat"] == 1  # model guessed boat
 
 
 def test_unclear_keeps_the_prediction(handler, s3):
@@ -547,3 +549,30 @@ def test_cannot_label_another_marinas_photo(handler, s3):
 def test_label_requires_a_result(handler, s3):
     image_id, slip_id = analyzed_slip(handler, s3)
     assert label(handler, image_id, slip_id + 99, "boat")[0] == 404
+
+
+def label_id(handler):
+    connection = handler.__globals__["get_connection"]()
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT id FROM slip_labels")
+        return cursor.fetchone()["id"]
+
+
+def test_remove_label_restores_the_models_result(handler, s3):
+    image_id, slip_id = analyzed_slip(handler, s3, occupied=True, confidence=0.6)
+    label(handler, image_id, slip_id, "empty")  # misclick
+    status, body = call(handler, {"runmode": "remove_label", "label_id": label_id(handler)})
+    assert status == 200 and body["labels"]["total"] == 0
+
+    connection = handler.__globals__["get_connection"]()
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT occupied, confidence FROM slip_observations WHERE slip_id = %s", (slip_id,))
+        row = cursor.fetchone()
+    assert row["occupied"] == 1 and float(row["confidence"]) == 0.6
+
+
+def test_remove_other_marinas_label(handler, s3):
+    image_id, slip_id = analyzed_slip(handler, s3)
+    label(handler, image_id, slip_id, "boat")
+    setup_marina(handler, OTHER_USER)
+    assert call(handler, {"runmode": "remove_label", "label_id": label_id(handler)}, OTHER_USER)[0] == 404
