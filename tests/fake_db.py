@@ -145,6 +145,22 @@ CREATE TABLE slip_labels (
   updated_at           TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (image_id, slip_id)
 );
+
+CREATE TABLE model_versions (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  version     INTEGER NOT NULL UNIQUE,
+  name        VARCHAR(64) NOT NULL,
+  base_model  VARCHAR(64) NOT NULL,
+  weights     JSON NOT NULL,
+  label_hash  CHAR(64) NOT NULL,
+  label_count INTEGER NOT NULL,
+  boat_count  INTEGER NOT NULL,
+  empty_count INTEGER NOT NULL,
+  metrics     JSON,
+  active      BOOLEAN NOT NULL DEFAULT 0,
+  job_id      INTEGER,
+  trained_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
