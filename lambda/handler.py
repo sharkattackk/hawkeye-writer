@@ -409,9 +409,10 @@ def label_stats(cursor, marina_id):
         "SELECT COUNT(*) AS total, "
         "COALESCE(SUM(CASE WHEN label <> 'unclear' THEN 1 ELSE 0 END), 0) AS decided, "
         "COALESCE(SUM(CASE WHEN label <> 'unclear' AND predicted_occupied = (label = 'boat') THEN 1 ELSE 0 END), 0) AS agreed, "
-        "COALESCE(SUM(CASE WHEN label = 'boat' THEN 1 ELSE 0 END), 0) AS boat, "
-        "COALESCE(SUM(CASE WHEN label = 'empty' THEN 1 ELSE 0 END), 0) AS empty, "
-        "COALESCE(SUM(CASE WHEN label = 'unclear' THEN 1 ELSE 0 END), 0) AS unclear "
+        # EMPTY is a reserved word in MySQL 8, so the aliases carry a suffix
+        "COALESCE(SUM(CASE WHEN label = 'boat' THEN 1 ELSE 0 END), 0) AS boat_count, "
+        "COALESCE(SUM(CASE WHEN label = 'empty' THEN 1 ELSE 0 END), 0) AS empty_count, "
+        "COALESCE(SUM(CASE WHEN label = 'unclear' THEN 1 ELSE 0 END), 0) AS unclear_count "
         "FROM slip_labels WHERE marina_id = %s",
         (marina_id,),
     )
@@ -422,7 +423,11 @@ def label_stats(cursor, marina_id):
         "decided": decided,
         "agreed": int(row["agreed"]),
         "accuracy": round(int(row["agreed"]) / decided, 3) if decided else None,
-        "by_label": {"boat": int(row["boat"]), "empty": int(row["empty"]), "unclear": int(row["unclear"])},
+        "by_label": {
+            "boat": int(row["boat_count"]),
+            "empty": int(row["empty_count"]),
+            "unclear": int(row["unclear_count"]),
+        },
     }
 
 
