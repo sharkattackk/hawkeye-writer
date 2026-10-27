@@ -203,18 +203,32 @@ def setup_marina(handler, user=USER):
     assert call(handler, {"runmode": "create_marina", "name": "Harbourfront"}, user)[0] == 200
 
 
-def upload_reference(handler, s3, user=USER, content_type="image/jpeg"):
-    status, body = call(handler, {"runmode": "create_image_upload", "content_type": content_type, "file_size": 1234}, user)
+def uploaded_image(handler, s3, user=USER, content_type="image/jpeg", size=1234):
+    """An image the 'browser' has uploaded to S3 but not confirmed yet -> image id."""
+    status, body = call(handler, {"runmode": "create_image_upload", "content_type": content_type, "file_size": size}, user)
     assert status == 200
-    key = body["upload"]["fields"]["key"]
-    s3.objects[key] = {"size": 1234, "content_type": content_type}
-    status, body = call(handler, {"runmode": "confirm_image", "id": body["image_id"], "width_px": 4000, "height_px": 3000}, user)
-    assert status == 200
-    return body["image"]
+    s3.objects[body["upload"]["fields"]["key"]] = {"size": size, "content_type": content_type}
+    return body["image_id"]
 
 
-def save(handler, slips, user=USER):
-    return call(handler, {"runmode": "save_slips", "slips": slips}, user)
+def add_reference(handler, s3, name="Main", user=USER):
+    return call(handler, {
+        "runmode": "create_reference", "image_id": uploaded_image(handler, s3, user),
+        "width_px": 4000, "height_px": 3000, "name": name,
+    }, user)
+
+
+def upload_reference(handler, s3, user=USER, name="Main"):
+    status, body = add_reference(handler, s3, name, user)
+    assert status == 200, body
+    return body["reference"]
+
+
+def save(handler, slips, user=USER, reference_id=None):
+    body = {"runmode": "save_slips", "slips": slips}
+    if reference_id is not None:
+        body["reference_id"] = reference_id
+    return call(handler, body, user)
 
 
 def test_create_image_upload(handler, s3):
@@ -242,46 +256,195 @@ def test_create_image_upload_requires_marina(handler, s3):
     assert status == 409
 
 
-def test_confirm_image_sets_reference(handler, s3):
+def query(handler, sql, params=()):
+    with handler.__globals__["get_connection"]().cursor() as cursor:
+        cursor.execute(sql, params)
+        return cursor.fetchall()
+
+
+def test_create_reference(handler, s3):
     setup_marina(handler)
-    image = upload_reference(handler, s3)
-    assert image["status"] == "uploaded"
-    assert (image["width_px"], image["height_px"]) == (4000, 3000)
-    assert register(handler)["marina"]["reference_image_id"] == image["id"]
+    reference = upload_reference(handler, s3, name="North basin")
+    assert reference["name"] == "North basin"
+    assert (reference["width_px"], reference["height_px"]) == (4000, 3000)
+    assert reference["slip_count"] == 0
+    assert query(handler, "SELECT status FROM marina_images WHERE id = %s", (reference["image_id"],)) == [
+        {"status": "uploaded"}
+    ]
 
 
-def test_confirm_image_before_upload(handler, s3):
+def test_create_reference_before_upload(handler, s3):
     setup_marina(handler)
     _, body = call(handler, {"runmode": "create_image_upload", "content_type": "image/jpeg", "file_size": 10})
-    status, body = call(handler, {"runmode": "confirm_image", "id": body["image_id"], "width_px": 10, "height_px": 10})
+    status, body = call(handler, {
+        "runmode": "create_reference", "image_id": body["image_id"], "width_px": 10, "height_px": 10, "name": "Main",
+    })
     assert status == 400
     assert "uploaded" in body["error"]
 
 
-def test_confirm_image_wrong_type(handler, s3):
+def test_create_reference_wrong_type(handler, s3):
     setup_marina(handler)
     _, body = call(handler, {"runmode": "create_image_upload", "content_type": "image/jpeg", "file_size": 10})
     s3.objects[body["upload"]["fields"]["key"]] = {"size": 10, "content_type": "text/html"}
-    status, _ = call(handler, {"runmode": "confirm_image", "id": body["image_id"], "width_px": 10, "height_px": 10})
+    status, _ = call(handler, {
+        "runmode": "create_reference", "image_id": body["image_id"], "width_px": 10, "height_px": 10, "name": "Main",
+    })
     assert status == 400
 
 
-def test_confirm_other_marinas_image(handler, s3):
+def test_create_reference_from_other_marinas_image(handler, s3):
     setup_marina(handler)
-    image = upload_reference(handler, s3)
+    image_id = uploaded_image(handler, s3)
     setup_marina(handler, OTHER_USER)
-    status, _ = call(handler, {"runmode": "confirm_image", "id": image["id"], "width_px": 1, "height_px": 1}, OTHER_USER)
+    status, _ = call(handler, {
+        "runmode": "create_reference", "image_id": image_id, "width_px": 1, "height_px": 1, "name": "Mine",
+    }, OTHER_USER)
     assert status == 404
 
 
-def test_cannot_replace_reference_once_slips_exist(handler, s3):
+def test_reference_names_are_unique_and_required(handler, s3):
     setup_marina(handler)
-    upload_reference(handler, s3)
-    assert save(handler, [{"label": "A1", "polygon": SQUARE}])[0] == 200
-    _, body = call(handler, {"runmode": "create_image_upload", "content_type": "image/jpeg", "file_size": 10})
-    s3.objects[body["upload"]["fields"]["key"]] = {"size": 10, "content_type": "image/jpeg"}
-    status, _ = call(handler, {"runmode": "confirm_image", "id": body["image_id"], "width_px": 10, "height_px": 10})
+    upload_reference(handler, s3, name="North")
+    assert add_reference(handler, s3, "north")[0] == 409
+    assert add_reference(handler, s3, "  ")[0] == 400
+
+
+def test_confirming_a_reference_twice_creates_one(handler, s3):
+    setup_marina(handler)
+    image_id = uploaded_image(handler, s3)
+    body = {"runmode": "create_reference", "image_id": image_id, "width_px": 9, "height_px": 9, "name": "Main"}
+    first, second = call(handler, body)[1], call(handler, body)[1]
+    assert first["reference"]["id"] == second["reference"]["id"]
+    assert len(query(handler, "SELECT id FROM reference_photos")) == 1
+
+
+def test_reference_thumbnail(handler, s3):
+    setup_marina(handler)
+    status, body = call(handler, {
+        "runmode": "create_image_upload", "content_type": "image/png", "file_size": 5000, "thumbnail_size": 300,
+    })
+    assert status == 200
+    thumb_key = body["thumbnail_upload"]["fields"]["key"]
+    assert thumb_key.endswith("-thumb.jpg") and body["thumbnail_upload"]["fields"]["Content-Type"] == "image/jpeg"
+    s3.objects[body["upload"]["fields"]["key"]] = {"size": 5000, "content_type": "image/png"}
+    s3.objects[thumb_key] = {"size": 300, "content_type": "image/jpeg"}
+    call(handler, {"runmode": "create_reference", "image_id": body["image_id"], "width_px": 9, "height_px": 9, "name": "A"})
+    assert query(handler, "SELECT thumbnail_s3_key FROM marina_images WHERE id = %s", (body["image_id"],)) == [
+        {"thumbnail_s3_key": thumb_key}
+    ]
+
+    # A thumbnail that never arrived is dropped; lists use the full photo instead
+    _, body = call(handler, {"runmode": "create_image_upload", "content_type": "image/png", "file_size": 5, "thumbnail_size": 3})
+    s3.objects[body["upload"]["fields"]["key"]] = {"size": 5, "content_type": "image/png"}
+    call(handler, {"runmode": "create_reference", "image_id": body["image_id"], "width_px": 9, "height_px": 9, "name": "B"})
+    assert query(handler, "SELECT thumbnail_s3_key FROM marina_images WHERE id = %s", (body["image_id"],)) == [
+        {"thumbnail_s3_key": None}
+    ]
+
+
+def test_thumbnail_size_limit(handler, s3):
+    setup_marina(handler)
+    status, _ = call(handler, {
+        "runmode": "create_image_upload", "content_type": "image/png", "file_size": 5000, "thumbnail_size": 3 * 1024 * 1024,
+    })
+    assert status == 400
+
+
+def test_rename_reference(handler, s3):
+    setup_marina(handler)
+    north = upload_reference(handler, s3, name="North")
+    upload_reference(handler, s3, name="South")
+    status, body = call(handler, {"runmode": "rename_reference", "reference_id": north["id"], "name": "North basin"})
+    assert status == 200 and body["reference"]["name"] == "North basin"
+    assert call(handler, {"runmode": "rename_reference", "reference_id": north["id"], "name": "south"})[0] == 409
+    # renaming to itself (e.g. a case change) is fine
+    assert call(handler, {"runmode": "rename_reference", "reference_id": north["id"], "name": "NORTH BASIN"})[0] == 200
+
+    setup_marina(handler, OTHER_USER)
+    assert call(handler, {"runmode": "rename_reference", "reference_id": north["id"], "name": "X"}, OTHER_USER)[0] == 404
+
+
+def test_several_reference_photos_each_keep_their_slips(handler, s3):
+    setup_marina(handler)
+    north = upload_reference(handler, s3, name="North")
+    south = upload_reference(handler, s3, name="South")
+    assert save(handler, [{"label": "A1", "polygon": SQUARE}])[0] == 400  # which photo?
+
+    status, body = save(handler, [{"label": "A1", "dock": "A", "polygon": SQUARE}], reference_id=north["id"])
+    assert status == 200 and body["slips"][0]["reference_id"] == north["id"]
+    status, body = save(handler, [{"label": "B1", "dock": "B", "polygon": SQUARE}], reference_id=south["id"])
+    assert status == 200
+
+    # Saving one photo's layout leaves the other's alone
+    status, body = save(handler, [{"label": "A2", "dock": "A", "polygon": SQUARE}], reference_id=north["id"])
+    assert [s["label"] for s in body["slips"]] == ["A2"]
+    assert sorted(row["label"] for row in query(handler, "SELECT label FROM slips")) == ["A2", "B1"]
+    assert sorted(row["name"] for row in query(handler, "SELECT name FROM docks")) == ["A", "B"]
+
+
+def test_slip_labels_are_unique_across_reference_photos(handler, s3):
+    setup_marina(handler)
+    north = upload_reference(handler, s3, name="North")
+    south = upload_reference(handler, s3, name="South")
+    save(handler, [{"label": "A1", "polygon": SQUARE}], reference_id=north["id"])
+    status, body = save(handler, [{"label": "a1", "polygon": SQUARE}], reference_id=south["id"])
     assert status == 409
+    assert "A1 (on 'North')" in body["error"]
+
+
+def test_cannot_move_a_slip_to_another_reference_photo(handler, s3):
+    setup_marina(handler)
+    north = upload_reference(handler, s3, name="North")
+    south = upload_reference(handler, s3, name="South")
+    _, body = save(handler, [{"label": "A1", "polygon": SQUARE}], reference_id=north["id"])
+    slip_id = body["slips"][0]["id"]
+    assert save(handler, [{"id": slip_id, "label": "A1", "polygon": SQUARE}], reference_id=south["id"])[0] == 400
+
+
+def test_delete_reference(handler, s3):
+    calibrate(handler, s3)  # "Main" with A1
+    south = upload_reference(handler, s3, name="South")
+    save(handler, [{"label": "B1", "dock": "B", "polygon": SQUARE}, {"label": "B2", "polygon": SQUARE}],
+         reference_id=south["id"])
+    _, update = upload_update(handler, s3, reference_id=south["id"])
+    slip_id = query(handler, "SELECT id FROM slips WHERE label = 'B1'")[0]["id"]
+    query(handler, "INSERT INTO slip_observations (job_id, image_id, slip_id, label, occupied, observed_at) "
+                   "VALUES (%s, %s, %s, 'B1', 1, CURRENT_TIMESTAMP)", (update["job"]["id"], update["image"]["id"], slip_id))
+    _, queued = upload_update(handler, s3, reference_id=south["id"])
+
+    status, body = call(handler, {"runmode": "delete_reference", "reference_id": south["id"]})
+    assert status == 200 and body == {"deleted_slips": 2}
+    assert [row["label"] for row in query(handler, "SELECT label FROM slips")] == ["A1"]
+    assert [row["name"] for row in query(handler, "SELECT name FROM docks")] == []  # B was only used by B1
+    # Past results stay in history; the queued update has nothing to compare with
+    assert query(handler, "SELECT slip_id, label FROM slip_observations") == [{"slip_id": None, "label": "B1"}]
+    jobs = {row["id"]: row for row in query(handler, "SELECT id, status, reference_id, message FROM analysis_jobs")}
+    assert jobs[queued["job"]["id"]]["status"] == "failed"
+    assert jobs[queued["job"]["id"]]["message"] == "Its reference photo was deleted"
+    assert jobs[queued["job"]["id"]]["reference_id"] is None
+
+
+def test_cannot_delete_the_only_reference_of_a_calibrated_marina(handler, s3):
+    calibrate(handler, s3)
+    reference_id = query(handler, "SELECT id FROM reference_photos")[0]["id"]
+    status, body = call(handler, {"runmode": "delete_reference", "reference_id": reference_id})
+    assert status == 409 and "only reference photo" in body["error"]
+
+
+def test_delete_the_only_reference_while_setting_up(handler, s3):
+    setup_marina(handler)
+    reference = upload_reference(handler, s3)
+    save(handler, [{"label": "A1", "polygon": SQUARE}])
+    assert call(handler, {"runmode": "delete_reference", "reference_id": reference["id"]})[0] == 200
+    assert query(handler, "SELECT id FROM reference_photos") == []
+
+
+def test_delete_other_marinas_reference(handler, s3):
+    setup_marina(handler)
+    reference = upload_reference(handler, s3)
+    setup_marina(handler, OTHER_USER)
+    assert call(handler, {"runmode": "delete_reference", "reference_id": reference["id"]}, OTHER_USER)[0] == 404
 
 
 def test_save_slips_creates_with_docks(handler, s3):
@@ -351,7 +514,7 @@ def test_save_slips_validation(handler, s3, slips):
     assert save(handler, slips)[0] == 400
 
 
-def test_save_slips_requires_reference_image(handler, s3):
+def test_save_slips_requires_reference_photo(handler, s3):
     setup_marina(handler)
     assert save(handler, [{"label": "A1", "polygon": SQUARE}])[0] == 409
 
@@ -361,14 +524,17 @@ def test_cannot_edit_other_marinas_slips(handler, s3):
     upload_reference(handler, s3)
     _, body = save(handler, [{"label": "A1", "polygon": SQUARE}])
     setup_marina(handler, OTHER_USER)
-    upload_reference(handler, s3, OTHER_USER)
+    other = upload_reference(handler, s3, OTHER_USER)
     status, _ = save(handler, [{"id": body["slips"][0]["id"], "label": "X", "polygon": SQUARE}], OTHER_USER)
     assert status == 400
+    # nor save onto another marina's reference photo
+    reference_id = query(handler, "SELECT id FROM reference_photos WHERE id <> %s", (other["id"],))[0]["id"]
+    assert save(handler, [{"label": "X", "polygon": SQUARE}], OTHER_USER, reference_id)[0] == 404
 
 
 def test_finish_calibration(handler, s3):
     setup_marina(handler)
-    assert call(handler, {"runmode": "finish_calibration"})[0] == 409  # no image
+    assert call(handler, {"runmode": "finish_calibration"})[0] == 409  # no reference photo
     upload_reference(handler, s3)
     assert call(handler, {"runmode": "finish_calibration"})[0] == 409  # no slips
     save(handler, [{"label": "A1", "polygon": SQUARE}])
@@ -386,14 +552,11 @@ def calibrate(handler, s3, user=USER):
     assert call(handler, {"runmode": "finish_calibration"}, user)[0] == 200
 
 
-def upload_update(handler, s3, user=USER):
-    _, body = call(handler, {"runmode": "create_image_upload", "content_type": "image/jpeg", "file_size": 99}, user)
-    s3.objects[body["upload"]["fields"]["key"]] = {"size": 99, "content_type": "image/jpeg"}
-    return call(
-        handler,
-        {"runmode": "confirm_image", "id": body["image_id"], "width_px": 4000, "height_px": 3000, "set_reference": False},
-        user,
-    )
+def upload_update(handler, s3, user=USER, reference_id=None):
+    body = {"runmode": "confirm_image", "id": uploaded_image(handler, s3, user, size=99), "width_px": 4000, "height_px": 3000}
+    if reference_id is not None:
+        body["reference_id"] = reference_id
+    return call(handler, body, user)
 
 
 def test_update_queues_analysis_job(handler, s3):
@@ -402,15 +565,37 @@ def test_update_queues_analysis_job(handler, s3):
     assert status == 200
     assert body["job"]["status"] == "pending"
     assert body["job"]["image_id"] == body["image"]["id"]
-    # the reference image is unchanged
-    assert register(handler)["marina"]["reference_image_id"] != body["image"]["id"]
+    assert body["job"]["reference_id"] == query(handler, "SELECT id FROM reference_photos")[0]["id"]
+
+
+def test_update_is_compared_with_the_chosen_reference(handler, s3):
+    calibrate(handler, s3)
+    south = upload_reference(handler, s3, name="South")
+    assert upload_update(handler, s3)[0] == 400  # several photos: say which
+    assert upload_update(handler, s3, reference_id=south["id"])[0] == 409  # South has no slips yet
+    save(handler, [{"label": "B1", "polygon": SQUARE}], reference_id=south["id"])
+    status, body = upload_update(handler, s3, reference_id=south["id"])
+    assert status == 200 and body["job"]["reference_id"] == south["id"]
+    assert upload_update(handler, s3, reference_id=999)[0] == 404
+
+
+def test_reference_photo_is_not_an_update_and_vice_versa(handler, s3):
+    calibrate(handler, s3)
+    reference = query(handler, "SELECT image_id FROM reference_photos")[0]
+    status, _ = call(handler, {"runmode": "confirm_image", "id": reference["image_id"], "width_px": 1, "height_px": 1})
+    assert status == 409
+    _, body = upload_update(handler, s3)
+    status, _ = call(handler, {
+        "runmode": "create_reference", "image_id": body["image"]["id"], "width_px": 1, "height_px": 1, "name": "X",
+    })
+    assert status == 409
 
 
 def test_confirming_update_twice_queues_once(handler, s3):
     calibrate(handler, s3)
     _, body = upload_update(handler, s3)
     image_id = body["image"]["id"]
-    again = call(handler, {"runmode": "confirm_image", "id": image_id, "width_px": 1, "height_px": 1, "set_reference": False})
+    again = call(handler, {"runmode": "confirm_image", "id": image_id, "width_px": 1, "height_px": 1})
     assert again[0] == 200 and again[1]["job"]["id"] == body["job"]["id"]
     connection = handler.__globals__["get_connection"]()
     with connection.cursor() as cursor:
@@ -426,12 +611,10 @@ def test_update_requires_calibration(handler, s3):
     assert "Calibrate" in body["error"]
 
 
-def test_reference_upload_has_no_job(handler, s3):
+def test_reference_photo_has_no_job(handler, s3):
     setup_marina(handler)
-    _, body = call(handler, {"runmode": "create_image_upload", "content_type": "image/jpeg", "file_size": 9})
-    s3.objects[body["upload"]["fields"]["key"]] = {"size": 9, "content_type": "image/jpeg"}
-    status, body = call(handler, {"runmode": "confirm_image", "id": body["image_id"], "width_px": 1, "height_px": 1})
-    assert status == 200 and body["job"] is None
+    upload_reference(handler, s3)
+    assert query(handler, "SELECT id FROM analysis_jobs") == []
 
 
 def test_retry_failed_analysis(handler, s3):
@@ -446,6 +629,15 @@ def test_retry_failed_analysis(handler, s3):
     status, body = call(handler, {"runmode": "retry_analysis", "image_id": image_id})
     assert status == 200
     assert body["job"]["status"] == "pending" and body["job"]["message"] is None
+
+
+def test_retry_with_another_reference_photo(handler, s3):
+    calibrate(handler, s3)
+    _, body = upload_update(handler, s3)
+    south = upload_reference(handler, s3, name="South")
+    query(handler, "UPDATE analysis_jobs SET status = 'failed'")
+    status, retried = call(handler, {"runmode": "retry_analysis", "image_id": body["image"]["id"], "reference_id": south["id"]})
+    assert status == 200 and retried["job"]["reference_id"] == south["id"]
 
 
 def test_retry_other_marinas_job(handler, s3):

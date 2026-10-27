@@ -96,14 +96,17 @@ def create_marina(payload, event):
 
 IMAGE_TYPES = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
 MAX_IMAGE_BYTES = 100 * 1024 * 1024
+MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024
 SLIP_KINDS = ("slip", "t_head", "side_tie", "mooring")
 MAX_SLIPS = 2000
 
 
 def create_image_upload(payload, event):
-    """{"content_type", "file_size"} -> {"image_id", "upload": {"url", "fields"}}
+    """{"content_type", "file_size", "thumbnail_size"?} -> {"image_id", "upload", "thumbnail_upload"?}
 
-    The browser POSTs the file to upload.url with upload.fields, then calls confirm_image.
+    The browser POSTs the file to upload.url with upload.fields, then calls confirm_image
+    (a drone update) or create_reference (a new reference photo). With thumbnail_size, it
+    also gets a form for a small JPEG copy it made, shown in lists and pickers.
     """
     content_type = payload.get("content_type")
     if content_type not in IMAGE_TYPES:
@@ -111,85 +114,165 @@ def create_image_upload(payload, event):
     file_size = _positive_int(payload, "file_size")
     if file_size > MAX_IMAGE_BYTES:
         raise RunmodeError(400, f"Images must be at most {MAX_IMAGE_BYTES // (1024 * 1024)} MB")
+    thumbnail_size = None
+    if payload.get("thumbnail_size") is not None:
+        thumbnail_size = _positive_int(payload, "thumbnail_size")
+        if thumbnail_size > MAX_THUMBNAIL_BYTES:
+            raise RunmodeError(400, f"Thumbnails must be at most {MAX_THUMBNAIL_BYTES // (1024 * 1024)} MB")
 
     with get_connection().cursor() as cursor:
         user = _require_marina_user(cursor, user_id(event))
-        key = f"marinas/{user['marina_id']}/images/{uuid.uuid4().hex}.{IMAGE_TYPES[content_type]}"
+        name = uuid.uuid4().hex
+        key = f"marinas/{user['marina_id']}/images/{name}.{IMAGE_TYPES[content_type]}"
+        thumbnail_key = f"marinas/{user['marina_id']}/images/{name}-thumb.jpg" if thumbnail_size else None
         cursor.execute(
-            "INSERT INTO marina_images (marina_id, s3_key, content_type, file_size_bytes, uploaded_by) "
-            "VALUES (%s, %s, %s, %s, %s)",
-            (user["marina_id"], key, content_type, file_size, user["id"]),
+            "INSERT INTO marina_images (marina_id, s3_key, thumbnail_s3_key, content_type, file_size_bytes, uploaded_by) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            (user["marina_id"], key, thumbnail_key, content_type, file_size, user["id"]),
         )
         image_id = cursor.lastrowid
 
     # S3 rejects anything other than this type, or larger than the declared size
-    return {"image_id": image_id, "upload": storage.presigned_upload(key, content_type, file_size)}
+    result = {"image_id": image_id, "upload": storage.presigned_upload(key, content_type, file_size)}
+    if thumbnail_key:
+        result["thumbnail_upload"] = storage.presigned_upload(thumbnail_key, "image/jpeg", thumbnail_size)
+    return result
 
 
 def confirm_image(payload, event):
-    """{"id", "width_px", "height_px", "set_reference"?: true} -> {"image", "job"}
+    """{"id", "width_px", "height_px", "reference_id"?} -> {"image", "job"}
 
-    Checks the file reached S3 and records its size and dimensions. Then either:
-    - set_reference true (default): makes it the marina's reference image, the
-      coordinate frame for slip polygons (calibration); job is None.
-    - set_reference false: treats it as a drone update of a calibrated marina and
-      queues an analysis job for hawkeye-worker; job is the new job.
+    A drone update: checks the file reached S3, records its size and dimensions, and
+    queues an analysis job comparing it with reference photo reference_id (which may be
+    left out when the marina has only one).
     """
     image_id = _positive_int(payload, "id")
     width_px = _positive_int(payload, "width_px")
     height_px = _positive_int(payload, "height_px")
-    set_reference = payload.get("set_reference", True) is not False
 
     connection = get_connection()
     with connection.cursor() as cursor:
         user = _require_marina_user(cursor, user_id(event))
         marina_id = user["marina_id"]
         image = _get_image(cursor, image_id, marina_id)
-        marina = _get_marina(cursor, marina_id)
-
-        if set_reference:
-            if marina["reference_image_id"] not in (None, image_id) and _slip_count(cursor, marina_id):
-                # Slip polygons are relative to the current reference image
-                raise RunmodeError(409, "Slips are already labelled on another reference image")
-        else:
-            if marina["calibrated_at"] is None:
-                raise RunmodeError(409, "Calibrate your marina before uploading drone updates")
-            if image_id == marina["reference_image_id"]:
-                raise RunmodeError(409, "That is the reference image")
-
-        uploaded = storage.head(image["s3_key"])
-        if uploaded is None:
-            raise RunmodeError(400, "The file hasn't been uploaded yet")
-        if uploaded["content_type"] != image["content_type"]:
-            cursor.execute("UPDATE marina_images SET status = 'failed' WHERE id = %s", (image_id,))
-            raise RunmodeError(400, "Uploaded file type doesn't match")
+        if _get_marina(cursor, marina_id)["calibrated_at"] is None:
+            raise RunmodeError(409, "Calibrate your marina before uploading drone updates")
+        reference = _chosen_reference(cursor, payload, marina_id)
+        if _reference_using_image(cursor, image_id):
+            raise RunmodeError(409, "That is a reference photo")
+        if not _slip_count(cursor, marina_id, reference["id"]):
+            raise RunmodeError(409, f"Reference photo '{reference['name']}' has no slips yet")
 
         connection.begin()
         try:
-            cursor.execute(
-                "UPDATE marina_images SET status = 'uploaded', file_size_bytes = %s, width_px = %s, height_px = %s "
-                "WHERE id = %s",
-                (uploaded["size"], width_px, height_px, image_id),
-            )
-            if set_reference:
-                cursor.execute("UPDATE marinas SET reference_image_id = %s WHERE id = %s", (image_id, marina_id))
-            elif _get_job(cursor, image_id) is None:  # confirming twice must not queue twice
+            _confirm_upload(cursor, image, width_px, height_px)
+            if _get_job(cursor, image_id) is None:  # confirming twice must not queue twice
                 cursor.execute(
-                    "INSERT INTO analysis_jobs (marina_id, image_id) VALUES (%s, %s)", (marina_id, image_id)
+                    "INSERT INTO analysis_jobs (marina_id, image_id, reference_id) VALUES (%s, %s, %s)",
+                    (marina_id, image_id, reference["id"]),
                 )
             connection.commit()
         except Exception:
             connection.rollback()
             raise
 
-        return {
-            "image": _get_image(cursor, image_id, marina_id),
-            "job": None if set_reference else _get_job(cursor, image_id),
-        }
+        return {"image": _get_image(cursor, image_id, marina_id), "job": _get_job(cursor, image_id)}
+
+
+MAX_REFERENCES = 50
+
+
+def create_reference(payload, event):
+    """{"image_id", "width_px", "height_px", "name"} -> {"reference"}
+
+    Makes an uploaded photo (see create_image_upload) a reference photo: the frame its
+    slips are drawn in. A marina can have several, each covering some of its slips.
+    """
+    image_id = _positive_int(payload, "image_id")
+    width_px = _positive_int(payload, "width_px")
+    height_px = _positive_int(payload, "height_px")
+    name = _text(payload, "name", 64, required=True)
+
+    connection = get_connection()
+    with connection.cursor() as cursor:
+        user = _require_marina_user(cursor, user_id(event))
+        marina_id = user["marina_id"]
+        image = _get_image(cursor, image_id, marina_id)
+        if _get_job(cursor, image_id) is not None:
+            raise RunmodeError(409, "That photo is a drone update")
+        existing = _reference_using_image(cursor, image_id)
+        if existing:
+            return {"reference": _get_reference(cursor, existing["id"], marina_id)}  # confirmed twice
+        cursor.execute("SELECT COUNT(*) AS n FROM reference_photos WHERE marina_id = %s", (marina_id,))
+        if cursor.fetchone()["n"] >= MAX_REFERENCES:
+            raise RunmodeError(409, f"A marina can have at most {MAX_REFERENCES} reference photos")
+        _require_unique_reference_name(cursor, marina_id, name)
+
+        connection.begin()
+        try:
+            _confirm_upload(cursor, image, width_px, height_px)
+            cursor.execute(
+                "INSERT INTO reference_photos (marina_id, image_id, name, created_by) VALUES (%s, %s, %s, %s)",
+                (marina_id, image_id, name, user["id"]),
+            )
+            reference_id = cursor.lastrowid
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return {"reference": _get_reference(cursor, reference_id, marina_id)}
+
+
+def rename_reference(payload, event):
+    """{"reference_id", "name"} -> {"reference"}"""
+    reference_id = _positive_int(payload, "reference_id")
+    name = _text(payload, "name", 64, required=True)
+    with get_connection().cursor() as cursor:
+        user = _require_marina_user(cursor, user_id(event))
+        _get_reference(cursor, reference_id, user["marina_id"])
+        _require_unique_reference_name(cursor, user["marina_id"], name, reference_id)
+        cursor.execute("UPDATE reference_photos SET name = %s WHERE id = %s", (name, reference_id))
+        return {"reference": _get_reference(cursor, reference_id, user["marina_id"])}
+
+
+def delete_reference(payload, event):
+    """{"reference_id"} -> {"deleted_slips"}
+
+    Deletes a reference photo and the slips drawn on it. Past drone updates compared
+    with it keep their results; queued ones fail, since there's nothing to compare with.
+    A calibrated marina keeps at least one reference photo.
+    """
+    reference_id = _positive_int(payload, "reference_id")
+    connection = get_connection()
+    with connection.cursor() as cursor:
+        user = _require_marina_user(cursor, user_id(event))
+        marina_id = user["marina_id"]
+        _get_reference(cursor, reference_id, marina_id)
+        cursor.execute("SELECT COUNT(*) AS n FROM reference_photos WHERE marina_id = %s", (marina_id,))
+        if cursor.fetchone()["n"] == 1 and _get_marina(cursor, marina_id)["calibrated_at"] is not None:
+            raise RunmodeError(409, "This is your only reference photo. Add another before deleting it.")
+
+        connection.begin()
+        try:
+            cursor.execute("DELETE FROM slips WHERE reference_id = %s", (reference_id,))
+            deleted = cursor.rowcount
+            _delete_unused_docks(cursor, marina_id)
+            cursor.execute(
+                "UPDATE analysis_jobs SET status = 'failed', finished_at = CURRENT_TIMESTAMP, "
+                "message = 'Its reference photo was deleted' WHERE reference_id = %s AND status = 'pending'",
+                (reference_id,),
+            )
+            cursor.execute("DELETE FROM reference_photos WHERE id = %s", (reference_id,))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return {"deleted_slips": deleted}
 
 
 def retry_analysis(payload, event):
-    """{"image_id"} -> {"job"}. Puts a failed analysis job back in the queue."""
+    """{"image_id", "reference_id"?} -> {"job"}. Puts a failed analysis job back in the queue,
+    optionally comparing it with a different reference photo this time."""
     image_id = _positive_int(payload, "image_id")
     with get_connection().cursor() as cursor:
         user = _require_marina_user(cursor, user_id(event))
@@ -199,21 +282,26 @@ def retry_analysis(payload, event):
             raise RunmodeError(404, "No analysis job for that image")
         if job["status"] != "failed":
             raise RunmodeError(409, f"Only failed jobs can be retried (this one is {job['status']})")
+        reference_id = job["reference_id"]
+        if payload.get("reference_id") is not None or reference_id is None:
+            reference_id = _chosen_reference(cursor, payload, user["marina_id"])["id"]
         cursor.execute(
             "UPDATE analysis_jobs SET status = 'pending', progress = NULL, message = NULL, worker_id = NULL, "
-            "queued_at = CURRENT_TIMESTAMP, started_at = NULL, heartbeat_at = NULL, finished_at = NULL "
-            "WHERE id = %s",
-            (job["id"],),
+            "queued_at = CURRENT_TIMESTAMP, started_at = NULL, heartbeat_at = NULL, finished_at = NULL, "
+            "reference_id = %s WHERE id = %s",
+            (reference_id, job["id"]),
         )
         return {"job": _get_job(cursor, image_id)}
 
 
 def save_slips(payload, event):
-    """{"slips": [{"id"?, "label", "polygon", "dock"?, "kind"?, "length_ft"?, "width_ft"?}]} -> {"slips"}
+    """{"reference_id", "slips": [{"id"?, "label", "polygon", "dock"?, "kind"?, "length_ft"?, "width_ft"?}]}
+    -> {"slips"}
 
-    Saves the marina's whole slip layout: slips with an id are updated, slips without
-    one are created, and existing slips missing from the list are deleted.
-    Polygons are 4 [x, y] corners, normalized 0-1 from the reference image's top-left.
+    Saves one reference photo's slip layout: slips with an id are updated, slips without
+    one are created, and that photo's slips missing from the list are deleted. Labels are
+    unique across the whole marina. Polygons are 4 [x, y] corners, normalized 0-1 from
+    the reference photo's top-left. reference_id may be left out when there's only one.
     """
     slips = payload.get("slips")
     if not isinstance(slips, list):
@@ -231,19 +319,31 @@ def save_slips(payload, event):
     with connection.cursor() as cursor:
         user = _require_marina_user(cursor, user_id(event))
         marina_id = user["marina_id"]
-        if _get_marina(cursor, marina_id)["reference_image_id"] is None:
-            raise RunmodeError(409, "Upload a reference image first")
+        reference = _chosen_reference(cursor, payload, marina_id)
+        reference_id = reference["id"]
 
-        cursor.execute("SELECT id FROM slips WHERE marina_id = %s", (marina_id,))
+        cursor.execute("SELECT id FROM slips WHERE reference_id = %s", (reference_id,))
         existing_ids = {row["id"] for row in cursor.fetchall()}
         kept_ids = [slip["id"] for slip in slips if slip["id"] is not None]
         unknown = sorted(set(kept_ids) - existing_ids)
         if unknown:
             raise RunmodeError(400, f"Unknown slip ids: {', '.join(map(str, unknown))}")
 
+        # A slip is on exactly one reference photo, so its label can't be used on another
+        cursor.execute(
+            "SELECT s.label, r.name FROM slips s JOIN reference_photos r ON r.id = s.reference_id "
+            "WHERE s.marina_id = %s AND s.reference_id <> %s",
+            (marina_id, reference_id),
+        )
+        elsewhere = {row["label"].lower(): row for row in cursor.fetchall()}
+        clashes = [elsewhere[label] for label in labels if label in elsewhere]
+        if clashes:
+            names = ", ".join(f"{row['label']} (on '{row['name']}')" for row in clashes)
+            raise RunmodeError(409, f"Slip labels already used on another reference photo: {names}")
+
         connection.begin()
         try:
-            _delete_slips_except(cursor, marina_id, kept_ids)
+            _delete_slips_except(cursor, reference_id, kept_ids)
             dock_ids = _ensure_docks(cursor, marina_id, slips)
 
             # Park kept labels first, so swapping two labels can't hit the unique key
@@ -264,8 +364,8 @@ def save_slips(payload, event):
                 if slip["id"] is None:
                     cursor.execute(
                         "INSERT INTO slips (dock_id, label, kind, polygon, center_x, center_y, length_ft, width_ft, "
-                        "marina_id, created_by) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                        (*values, marina_id, user["id"]),
+                        "marina_id, reference_id, created_by) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        (*values, marina_id, reference_id, user["id"]),
                     )
                 else:
                     cursor.execute(
@@ -274,28 +374,24 @@ def save_slips(payload, event):
                         (*values, slip["id"]),
                     )
 
-            # Remove docks no slip uses any more
-            cursor.execute(
-                "DELETE FROM docks WHERE marina_id = %s AND id NOT IN "
-                "(SELECT dock_id FROM slips WHERE marina_id = %s AND dock_id IS NOT NULL)",
-                (marina_id, marina_id),
-            )
+            _delete_unused_docks(cursor, marina_id)
             connection.commit()
         except Exception:
             connection.rollback()
             raise
 
-        return {"slips": _list_slips(cursor, marina_id)}
+        return {"slips": _list_slips(cursor, reference_id)}
 
 
 def finish_calibration(payload, event):
-    """Marks the marina calibrated (needs a reference image and at least one slip) -> {"user", "marina"}"""
+    """Marks the marina calibrated (needs a reference photo with at least one slip) -> {"user", "marina"}"""
     sub = user_id(event)
     with get_connection().cursor() as cursor:
         user = _require_marina_user(cursor, sub)
         marina = _get_marina(cursor, user["marina_id"])
-        if marina["reference_image_id"] is None:
-            raise RunmodeError(409, "Upload a reference image first")
+        cursor.execute("SELECT COUNT(*) AS n FROM reference_photos WHERE marina_id = %s", (marina["id"],))
+        if not cursor.fetchone()["n"]:
+            raise RunmodeError(409, "Upload a reference photo first")
         if not _slip_count(cursor, marina["id"]):
             raise RunmodeError(409, "Label at least one slip first")
         cursor.execute(
@@ -438,6 +534,9 @@ RUNMODES = {
     "create_marina": create_marina,
     "create_image_upload": create_image_upload,
     "confirm_image": confirm_image,
+    "create_reference": create_reference,
+    "rename_reference": rename_reference,
+    "delete_reference": delete_reference,
     "save_slips": save_slips,
     "finish_calibration": finish_calibration,
     "retry_analysis": retry_analysis,
@@ -449,11 +548,18 @@ RUNMODES = {
 USER_COLUMNS = "id, email, first_name, last_name, phone, marina_id, profile_completed_at, created_at"
 MARINA_COLUMNS = (
     "id, name, address_line1, address_line2, city, region, postal_code, country, "
-    "timezone, latitude, longitude, phone, email, created_by, created_at, reference_image_id, calibrated_at"
+    "timezone, latitude, longitude, phone, email, created_by, created_at, calibrated_at"
 )
-IMAGE_COLUMNS = "id, marina_id, s3_key, content_type, file_size_bytes, width_px, height_px, status, created_at"
+IMAGE_COLUMNS = (
+    "id, marina_id, s3_key, thumbnail_s3_key, content_type, file_size_bytes, width_px, height_px, status, created_at"
+)
 SLIP_COLUMNS = (
-    "s.id, s.label, s.kind, s.polygon, s.center_x, s.center_y, s.length_ft, s.width_ft, d.name AS dock"
+    "s.id, s.reference_id, s.label, s.kind, s.polygon, s.center_x, s.center_y, s.length_ft, s.width_ft, "
+    "d.name AS dock"
+)
+REFERENCE_COLUMNS = (
+    "r.id, r.name, r.image_id, r.created_at, i.width_px, i.height_px, "
+    "(SELECT COUNT(*) FROM slips s WHERE s.reference_id = r.id) AS slip_count"
 )
 
 
@@ -491,7 +597,7 @@ def _get_image(cursor, image_id, marina_id):
     return image
 
 
-JOB_COLUMNS = "id, image_id, status, progress, message, attempts, queued_at, started_at, finished_at"
+JOB_COLUMNS = "id, image_id, reference_id, status, progress, message, attempts, queued_at, started_at, finished_at"
 
 
 def _get_job(cursor, image_id):
@@ -499,16 +605,84 @@ def _get_job(cursor, image_id):
     return cursor.fetchone()
 
 
-def _slip_count(cursor, marina_id):
-    cursor.execute("SELECT COUNT(*) AS n FROM slips WHERE marina_id = %s", (marina_id,))
+def _slip_count(cursor, marina_id, reference_id=None):
+    if reference_id is None:
+        cursor.execute("SELECT COUNT(*) AS n FROM slips WHERE marina_id = %s", (marina_id,))
+    else:
+        cursor.execute("SELECT COUNT(*) AS n FROM slips WHERE reference_id = %s", (reference_id,))
     return cursor.fetchone()["n"]
 
 
-def _list_slips(cursor, marina_id):
+def _confirm_upload(cursor, image, width_px, height_px):
+    """Check the browser's upload reached S3 and record it (and its thumbnail, if any)."""
+    uploaded = storage.head(image["s3_key"])
+    if uploaded is None:
+        raise RunmodeError(400, "The file hasn't been uploaded yet")
+    if uploaded["content_type"] != image["content_type"]:
+        cursor.execute("UPDATE marina_images SET status = 'failed' WHERE id = %s", (image["id"],))
+        raise RunmodeError(400, "Uploaded file type doesn't match")
+    thumbnail_key = image["thumbnail_s3_key"]
+    if thumbnail_key and storage.head(thumbnail_key) is None:
+        thumbnail_key = None  # optional: lists fall back to the full photo
+    cursor.execute(
+        "UPDATE marina_images SET status = 'uploaded', file_size_bytes = %s, width_px = %s, height_px = %s, "
+        "thumbnail_s3_key = %s WHERE id = %s",
+        (uploaded["size"], width_px, height_px, thumbnail_key, image["id"]),
+    )
+
+
+def _get_reference(cursor, reference_id, marina_id):
+    cursor.execute(
+        f"SELECT {REFERENCE_COLUMNS} FROM reference_photos r JOIN marina_images i ON i.id = r.image_id "
+        "WHERE r.id = %s AND r.marina_id = %s",
+        (reference_id, marina_id),
+    )
+    reference = cursor.fetchone()
+    if reference is None:
+        raise RunmodeError(404, "Reference photo not found")
+    return reference
+
+
+def _chosen_reference(cursor, payload, marina_id):
+    """The reference photo named by payload["reference_id"], or the marina's only one."""
+    if payload.get("reference_id") is not None:
+        return _get_reference(cursor, _positive_int(payload, "reference_id"), marina_id)
+    cursor.execute("SELECT id FROM reference_photos WHERE marina_id = %s ORDER BY id LIMIT 2", (marina_id,))
+    rows = cursor.fetchall()
+    if not rows:
+        raise RunmodeError(409, "Upload a reference photo first")
+    if len(rows) > 1:
+        raise RunmodeError(400, "reference_id is required: this marina has several reference photos")
+    return _get_reference(cursor, rows[0]["id"], marina_id)
+
+
+def _reference_using_image(cursor, image_id):
+    cursor.execute("SELECT id FROM reference_photos WHERE image_id = %s", (image_id,))
+    return cursor.fetchone()
+
+
+def _require_unique_reference_name(cursor, marina_id, name, reference_id=None):
+    cursor.execute(
+        "SELECT id FROM reference_photos WHERE marina_id = %s AND LOWER(name) = LOWER(%s)", (marina_id, name)
+    )
+    row = cursor.fetchone()
+    if row and row["id"] != reference_id:
+        raise RunmodeError(409, f"There's already a reference photo called '{name}'")
+
+
+def _delete_unused_docks(cursor, marina_id):
+    cursor.execute(
+        "DELETE FROM docks WHERE marina_id = %s AND id NOT IN "
+        "(SELECT dock_id FROM slips WHERE marina_id = %s AND dock_id IS NOT NULL)",
+        (marina_id, marina_id),
+    )
+
+
+def _list_slips(cursor, reference_id):
     cursor.execute(
         f"SELECT {SLIP_COLUMNS} FROM slips s LEFT JOIN docks d ON d.id = s.dock_id "
-        "WHERE s.marina_id = %s ORDER BY s.label",
-        (marina_id,),
+        "WHERE s.reference_id = %s ORDER BY s.label",
+        (reference_id,),
     )
     slips = cursor.fetchall()
     for slip in slips:
@@ -517,14 +691,14 @@ def _list_slips(cursor, marina_id):
     return slips
 
 
-def _delete_slips_except(cursor, marina_id, kept_ids):
+def _delete_slips_except(cursor, reference_id, kept_ids):
     if kept_ids:
         placeholders = ", ".join(["%s"] * len(kept_ids))
         cursor.execute(
-            f"DELETE FROM slips WHERE marina_id = %s AND id NOT IN ({placeholders})", (marina_id, *kept_ids)
+            f"DELETE FROM slips WHERE reference_id = %s AND id NOT IN ({placeholders})", (reference_id, *kept_ids)
         )
     else:
-        cursor.execute("DELETE FROM slips WHERE marina_id = %s", (marina_id,))
+        cursor.execute("DELETE FROM slips WHERE reference_id = %s", (reference_id,))
 
 
 def _ensure_docks(cursor, marina_id, slips):

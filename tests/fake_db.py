@@ -35,7 +35,6 @@ CREATE TABLE marinas (
   created_by    INTEGER NOT NULL REFERENCES users(id),
   created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  reference_image_id INTEGER REFERENCES marina_images(id),
   calibrated_at TIMESTAMP
 );
 
@@ -44,6 +43,7 @@ CREATE TABLE marina_images (
   marina_id       INTEGER NOT NULL REFERENCES marinas(id),
   s3_key          VARCHAR(512) NOT NULL,
   annotated_s3_key VARCHAR(512),
+  thumbnail_s3_key VARCHAR(512),
   content_type    VARCHAR(64)  NOT NULL,
   file_size_bytes INTEGER,
   width_px        INTEGER,
@@ -59,6 +59,17 @@ CREATE TABLE marina_images (
   created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE reference_photos (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  marina_id  INTEGER NOT NULL REFERENCES marinas(id),
+  image_id   INTEGER NOT NULL UNIQUE REFERENCES marina_images(id),
+  name       VARCHAR(64) NOT NULL COLLATE NOCASE,
+  created_by INTEGER NOT NULL REFERENCES users(id),
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (marina_id, name)
+);
+
 CREATE TABLE docks (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   marina_id  INTEGER NOT NULL REFERENCES marinas(id),
@@ -70,6 +81,7 @@ CREATE TABLE docks (
 CREATE TABLE slips (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   marina_id  INTEGER NOT NULL REFERENCES marinas(id),
+  reference_id INTEGER NOT NULL REFERENCES reference_photos(id),
   dock_id    INTEGER REFERENCES docks(id) ON DELETE SET NULL,
   label      VARCHAR(32) NOT NULL COLLATE NOCASE,  -- MySQL's collation is case-insensitive
   kind       TEXT NOT NULL DEFAULT 'slip' CHECK (kind IN ('slip', 't_head', 'side_tie', 'mooring')),
@@ -88,6 +100,7 @@ CREATE TABLE analysis_jobs (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   marina_id    INTEGER NOT NULL REFERENCES marinas(id),
   image_id     INTEGER NOT NULL UNIQUE REFERENCES marina_images(id),
+  reference_id INTEGER REFERENCES reference_photos(id) ON DELETE SET NULL,
   status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded', 'failed')),
   progress     INTEGER,
   message      VARCHAR(255),
