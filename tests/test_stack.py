@@ -155,12 +155,12 @@ def test_storage_read():
     )
     actions = _policy_actions(template)
     assert "s3:GetObject" in actions
-    assert "s3:PutObject" not in actions
+    assert "s3:PutObject" not in actions and "s3:DeleteObject" not in actions
 
 
 def test_storage_write():
     stack = LambdaStack(_app(), "Lambda", config=dataclasses.replace(config, storage_access="write"))
-    assert {"s3:GetObject", "s3:PutObject", "s3:ListBucket"} <= _policy_actions(Template.from_stack(stack))
+    assert {"s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"} <= _policy_actions(Template.from_stack(stack))
 
 
 def test_no_storage_by_default():

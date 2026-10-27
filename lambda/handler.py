@@ -236,38 +236,81 @@ def rename_reference(payload, event):
 
 
 def delete_reference(payload, event):
-    """{"reference_id"} -> {"deleted_slips"}
+    """{"reference_id"} -> {"deleted": {"slips", "updates", "labels"}, "calibrated"}
 
-    Deletes a reference photo and the slips drawn on it. Past drone updates compared
-    with it keep their results; queued ones fail, since there's nothing to compare with.
-    A calibrated marina keeps at least one reference photo.
+    Deletes a reference photo and everything that depends on it: its slips, the drone
+    updates compared with it (their analysis, results and labels), and all of those
+    photos in S3. Deleting the last one returns the marina to uncalibrated (calibrated
+    is then False). Refused while an update is being analyzed against it.
     """
     reference_id = _positive_int(payload, "reference_id")
     connection = get_connection()
     with connection.cursor() as cursor:
         user = _require_marina_user(cursor, user_id(event))
         marina_id = user["marina_id"]
-        _get_reference(cursor, reference_id, marina_id)
-        cursor.execute("SELECT COUNT(*) AS n FROM reference_photos WHERE marina_id = %s", (marina_id,))
-        if cursor.fetchone()["n"] == 1 and _get_marina(cursor, marina_id)["calibrated_at"] is not None:
-            raise RunmodeError(409, "This is your only reference photo. Add another before deleting it.")
+        reference = _get_reference(cursor, reference_id, marina_id)
+        cursor.execute("SELECT image_id, status FROM analysis_jobs WHERE reference_id = %s", (reference_id,))
+        jobs = cursor.fetchall()
+        if any(job["status"] == "running" for job in jobs):
+            raise RunmodeError(409, "An update is being analyzed against this photo. Try again once it finishes.")
+        image_ids = [reference["image_id"], *(job["image_id"] for job in jobs)]
+        in_images = ", ".join(["%s"] * len(image_ids))
+        keys = _image_keys(cursor, image_ids, in_images)  # before the rows that name them go
 
         connection.begin()
         try:
-            cursor.execute("DELETE FROM slips WHERE reference_id = %s", (reference_id,))
-            deleted = cursor.rowcount
-            _delete_unused_docks(cursor, marina_id)
             cursor.execute(
-                "UPDATE analysis_jobs SET status = 'failed', finished_at = CURRENT_TIMESTAMP, "
-                "message = 'Its reference photo was deleted' WHERE reference_id = %s AND status = 'pending'",
-                (reference_id,),
+                f"DELETE FROM slip_labels WHERE image_id IN ({in_images}) "
+                "OR slip_id IN (SELECT id FROM slips WHERE reference_id = %s)",
+                (*image_ids, reference_id),
             )
+            labels = cursor.rowcount
+            cursor.execute(f"DELETE FROM slip_observations WHERE image_id IN ({in_images})", image_ids)
+            cursor.execute("DELETE FROM analysis_jobs WHERE reference_id = %s", (reference_id,))  # and their steps
+            cursor.execute("DELETE FROM slips WHERE reference_id = %s", (reference_id,))
+            slips = cursor.rowcount
+            _delete_unused_docks(cursor, marina_id)
             cursor.execute("DELETE FROM reference_photos WHERE id = %s", (reference_id,))
+            cursor.execute(f"DELETE FROM marina_images WHERE id IN ({in_images})", image_ids)
+            cursor.execute("SELECT COUNT(*) AS n FROM reference_photos WHERE marina_id = %s", (marina_id,))
+            calibrated = cursor.fetchone()["n"] > 0
+            if not calibrated:
+                cursor.execute("UPDATE marinas SET calibrated_at = NULL WHERE id = %s", (marina_id,))
             connection.commit()
         except Exception:
             connection.rollback()
             raise
-        return {"deleted_slips": deleted}
+
+    try:
+        storage.delete(keys)
+    except Exception as e:  # the database no longer points at them; leftovers only cost storage
+        print(f"Couldn't delete {len(keys)} imagery objects for reference {reference_id}: {e}")
+    return {"deleted": {"slips": slips, "updates": len(jobs), "labels": labels}, "calibrated": calibrated}
+
+
+def _image_keys(cursor, image_ids, in_images):
+    """Every S3 object made for these photos: originals, thumbnails, annotated copies,
+    slip crops and the worker's step images."""
+    keys = set()
+    cursor.execute(
+        f"SELECT s3_key, thumbnail_s3_key, annotated_s3_key FROM marina_images WHERE id IN ({in_images})", image_ids
+    )
+    for row in cursor.fetchall():
+        keys.update(key for key in row.values() if key)
+    cursor.execute(
+        f"SELECT crop_s3_key FROM slip_observations WHERE image_id IN ({in_images}) AND crop_s3_key IS NOT NULL",
+        image_ids,
+    )
+    keys.update(row["crop_s3_key"] for row in cursor.fetchall())
+    cursor.execute(
+        "SELECT s.artifacts FROM analysis_job_steps s JOIN analysis_jobs j ON j.id = s.job_id "
+        f"WHERE j.image_id IN ({in_images}) AND s.artifacts IS NOT NULL",
+        image_ids,
+    )
+    for row in cursor.fetchall():
+        artifacts = json.loads(row["artifacts"]) if isinstance(row["artifacts"], str) else row["artifacts"]
+        keys.update(key for key in artifacts.values() if key)
+    return sorted(keys)
 
 
 def retry_analysis(payload, event):

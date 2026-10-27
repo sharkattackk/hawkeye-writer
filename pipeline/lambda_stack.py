@@ -99,7 +99,9 @@ class LambdaStack(Stack):
         objects = f"arn:aws:s3:::{bucket_name}/*"
         self.function.add_to_role_policy(iam.PolicyStatement(actions=["s3:GetObject"], resources=[objects]))
         if access == "write":
-            self.function.add_to_role_policy(iam.PolicyStatement(actions=["s3:PutObject"], resources=[objects]))
+            self.function.add_to_role_policy(
+                iam.PolicyStatement(actions=["s3:PutObject", "s3:DeleteObject"], resources=[objects])
+            )
             # Lets head_object report a missing upload as 404 rather than 403
             self.function.add_to_role_policy(
                 iam.PolicyStatement(actions=["s3:ListBucket"], resources=[f"arn:aws:s3:::{bucket_name}"])

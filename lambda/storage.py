@@ -48,3 +48,11 @@ def head(key):
             return None
         raise
     return {"size": response["ContentLength"], "content_type": response.get("ContentType")}
+
+
+def delete(keys):
+    """Delete objects (write access). Keys that don't exist are fine."""
+    keys = list(keys)
+    for start in range(0, len(keys), 1000):  # S3's limit per request
+        batch = [{"Key": key} for key in keys[start:start + 1000]]
+        _s3.delete_objects(Bucket=bucket(), Delete={"Objects": batch, "Quiet": True})

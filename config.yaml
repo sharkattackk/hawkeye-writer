@@ -41,5 +41,5 @@ database:
 
 storage:
   # Access to the hawkeye imagery bucket (from hawkeye-database): none, read or write.
-  # read = presigned view URLs; write = also presigned uploads and checking uploads.
+  # read = presigned view URLs; write = also presigned uploads, checking uploads and deleting.
   access: write

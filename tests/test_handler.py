@@ -179,6 +179,7 @@ class FakeStorage:
 
     def __init__(self):
         self.objects = {}  # key -> {"size", "content_type"}
+        self.deleted = []
 
     def presigned_upload(self, key, content_type, max_bytes):
         return {"url": "https://bucket.example/", "fields": {"key": key, "Content-Type": content_type}}
@@ -186,12 +187,16 @@ class FakeStorage:
     def head(self, key):
         return self.objects.get(key)
 
+    def delete(self, keys):
+        self.deleted.extend(keys)
+
 
 @pytest.fixture
 def s3(handler, monkeypatch):
     fake = FakeStorage()
     monkeypatch.setattr(handler.__globals__["storage"], "presigned_upload", fake.presigned_upload)
     monkeypatch.setattr(handler.__globals__["storage"], "head", fake.head)
+    monkeypatch.setattr(handler.__globals__["storage"], "delete", fake.delete)
     return fake
 
 
@@ -402,41 +407,91 @@ def test_cannot_move_a_slip_to_another_reference_photo(handler, s3):
     assert save(handler, [{"id": slip_id, "label": "A1", "polygon": SQUARE}], reference_id=south["id"])[0] == 400
 
 
-def test_delete_reference(handler, s3):
+def analyzed_update(handler, s3, reference_id, slip_label):
+    """An update compared with reference_id, analyzed, with crops, step images and a label."""
+    _, update = upload_update(handler, s3, reference_id=reference_id)
+    job_id, image_id = update["job"]["id"], update["image"]["id"]
+    slip_id = query(handler, "SELECT id FROM slips WHERE label = %s", (slip_label,))[0]["id"]
+    query(handler, "UPDATE marina_images SET annotated_s3_key = %s WHERE id = %s", (f"annotated/{image_id}.jpg", image_id))
+    query(handler, "UPDATE analysis_jobs SET status = 'succeeded' WHERE id = %s", (job_id,))
+    query(handler, "INSERT INTO slip_observations (job_id, image_id, slip_id, label, crop_s3_key, occupied, observed_at) "
+                   "VALUES (%s, %s, %s, %s, %s, 1, CURRENT_TIMESTAMP)",
+          (job_id, image_id, slip_id, slip_label, f"annotated/{image_id}/crops/{slip_id}.jpg"))
+    query(handler, "INSERT INTO analysis_job_steps (job_id, attempt, step, status, artifacts) VALUES (%s, 1, 'align', "
+                   "'succeeded', %s)", (job_id, json.dumps({"overlay": f"annotated/{image_id}-overlay.jpg", "matches": None})))
+    assert label(handler, image_id, slip_id, "boat")[0] == 200
+    return image_id
+
+
+def test_delete_reference_removes_everything_that_depends_on_it(handler, s3):
     calibrate(handler, s3)  # "Main" with A1
     south = upload_reference(handler, s3, name="South")
     save(handler, [{"label": "B1", "dock": "B", "polygon": SQUARE}, {"label": "B2", "polygon": SQUARE}],
          reference_id=south["id"])
-    _, update = upload_update(handler, s3, reference_id=south["id"])
-    slip_id = query(handler, "SELECT id FROM slips WHERE label = 'B1'")[0]["id"]
-    query(handler, "INSERT INTO slip_observations (job_id, image_id, slip_id, label, occupied, observed_at) "
-                   "VALUES (%s, %s, %s, 'B1', 1, CURRENT_TIMESTAMP)", (update["job"]["id"], update["image"]["id"], slip_id))
+    main_id = query(handler, "SELECT id FROM reference_photos WHERE name = 'Main'")[0]["id"]
+    kept = analyzed_update(handler, s3, main_id, "A1")
+    gone = analyzed_update(handler, s3, south["id"], "B1")
     _, queued = upload_update(handler, s3, reference_id=south["id"])
+    south_keys = {row["s3_key"] for row in query(
+        handler, "SELECT s3_key FROM marina_images WHERE id IN (%s, %s, %s)", (south["image_id"], gone, queued["image"]["id"]))}
 
     status, body = call(handler, {"runmode": "delete_reference", "reference_id": south["id"]})
-    assert status == 200 and body == {"deleted_slips": 2}
+    assert status == 200
+    assert body == {"deleted": {"slips": 2, "updates": 2, "labels": 1}, "calibrated": True}
     assert [row["label"] for row in query(handler, "SELECT label FROM slips")] == ["A1"]
-    assert [row["name"] for row in query(handler, "SELECT name FROM docks")] == []  # B was only used by B1
-    # Past results stay in history; the queued update has nothing to compare with
-    assert query(handler, "SELECT slip_id, label FROM slip_observations") == [{"slip_id": None, "label": "B1"}]
-    jobs = {row["id"]: row for row in query(handler, "SELECT id, status, reference_id, message FROM analysis_jobs")}
-    assert jobs[queued["job"]["id"]]["status"] == "failed"
-    assert jobs[queued["job"]["id"]]["message"] == "Its reference photo was deleted"
-    assert jobs[queued["job"]["id"]]["reference_id"] is None
+    assert [row["name"] for row in query(handler, "SELECT name FROM reference_photos")] == ["Main"]
+    assert query(handler, "SELECT name FROM docks") == []  # B was only used by B1
+    # Only Main's update is left, with its result, label and step images
+    assert [row["image_id"] for row in query(handler, "SELECT image_id FROM analysis_jobs")] == [kept]
+    assert [row["image_id"] for row in query(handler, "SELECT image_id FROM slip_observations")] == [kept]
+    assert [row["image_id"] for row in query(handler, "SELECT image_id FROM slip_labels")] == [kept]
+    assert len(query(handler, "SELECT id FROM analysis_job_steps")) == 1
+    remaining = {row["id"] for row in query(handler, "SELECT id FROM marina_images")}
+    assert south["image_id"] not in remaining and gone not in remaining and kept in remaining
+    # ...and South's photos, annotated copies, crops and step images are deleted from S3
+    assert set(s3.deleted) >= south_keys | {f"annotated/{gone}.jpg", f"annotated/{gone}-overlay.jpg"}
+    assert any(key.startswith(f"annotated/{gone}/crops/") for key in s3.deleted)
+    kept_key = query(handler, "SELECT s3_key FROM marina_images WHERE id = %s", (kept,))[0]["s3_key"]
+    assert not any(
+        key in (kept_key, f"annotated/{kept}.jpg", f"annotated/{kept}-overlay.jpg") or key.startswith(f"annotated/{kept}/")
+        for key in s3.deleted
+    )
+    assert register(handler)["marina"]["calibrated_at"] is not None
 
 
-def test_cannot_delete_the_only_reference_of_a_calibrated_marina(handler, s3):
+def test_deleting_the_last_reference_resets_calibration(handler, s3):
     calibrate(handler, s3)
-    reference_id = query(handler, "SELECT id FROM reference_photos")[0]["id"]
-    status, body = call(handler, {"runmode": "delete_reference", "reference_id": reference_id})
-    assert status == 409 and "only reference photo" in body["error"]
+    main_id = query(handler, "SELECT id FROM reference_photos")[0]["id"]
+    analyzed_update(handler, s3, main_id, "A1")
+    status, body = call(handler, {"runmode": "delete_reference", "reference_id": main_id})
+    assert status == 200
+    assert body == {"deleted": {"slips": 1, "updates": 1, "labels": 1}, "calibrated": False}
+    assert register(handler)["marina"]["calibrated_at"] is None
+    for table in ("reference_photos", "slips", "docks", "analysis_jobs", "slip_observations", "slip_labels", "marina_images"):
+        assert query(handler, f"SELECT * FROM {table}") == [], table
+    # back to the start of calibration: a new reference photo can be added and used
+    reference = upload_reference(handler, s3, name="Main")
+    assert save(handler, [{"label": "A1", "polygon": SQUARE}])[0] == 200
+    assert call(handler, {"runmode": "finish_calibration"})[0] == 200
+    assert upload_update(handler, s3, reference_id=reference["id"])[0] == 200
+
+
+def test_cannot_delete_a_reference_while_an_update_is_analyzed_against_it(handler, s3):
+    calibrate(handler, s3)
+    main_id = query(handler, "SELECT id FROM reference_photos")[0]["id"]
+    upload_update(handler, s3)
+    query(handler, "UPDATE analysis_jobs SET status = 'running'")
+    status, body = call(handler, {"runmode": "delete_reference", "reference_id": main_id})
+    assert status == 409 and "being analyzed" in body["error"]
+    assert len(query(handler, "SELECT id FROM reference_photos")) == 1
 
 
 def test_delete_the_only_reference_while_setting_up(handler, s3):
     setup_marina(handler)
     reference = upload_reference(handler, s3)
     save(handler, [{"label": "A1", "polygon": SQUARE}])
-    assert call(handler, {"runmode": "delete_reference", "reference_id": reference["id"]})[0] == 200
+    status, body = call(handler, {"runmode": "delete_reference", "reference_id": reference["id"]})
+    assert status == 200 and body["calibrated"] is False
     assert query(handler, "SELECT id FROM reference_photos") == []
 
 
