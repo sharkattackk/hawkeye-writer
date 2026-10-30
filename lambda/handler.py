@@ -179,6 +179,136 @@ def confirm_image(payload, event):
         return {"image": _get_image(cursor, image_id, marina_id), "job": _get_job(cursor, image_id)}
 
 
+def create_upload_batch(payload, event):
+    """{"photos": [{"content_type", "file_size"}]} -> {"batch_id", "photos": [{"image_id", "upload"}]}
+
+    Starts an upload of several drone photos at once: at most one per reference photo
+    (with slips). The browser POSTs each file to its upload form, then calls
+    confirm_batch.
+    """
+    photos = payload.get("photos")
+    if not isinstance(photos, list) or not photos:
+        raise RunmodeError(400, "photos must be a non-empty list")
+    for i, photo in enumerate(photos):
+        if not isinstance(photo, dict):
+            raise RunmodeError(400, f"photos[{i}] must be an object")
+        if photo.get("content_type") not in IMAGE_TYPES:
+            raise RunmodeError(400, f"photos[{i}].content_type must be one of {', '.join(IMAGE_TYPES)}")
+        size = photo.get("file_size")
+        if not isinstance(size, int) or isinstance(size, bool) or not 0 < size <= MAX_IMAGE_BYTES:
+            raise RunmodeError(400, f"photos[{i}].file_size must be 1 byte to {MAX_IMAGE_BYTES // (1024 * 1024)} MB")
+
+    connection = get_connection()
+    with connection.cursor() as cursor:
+        user = _require_marina_user(cursor, user_id(event))
+        marina_id = user["marina_id"]
+        if _get_marina(cursor, marina_id)["calibrated_at"] is None:
+            raise RunmodeError(409, "Calibrate your marina before uploading drone updates")
+        allowed = _usable_reference_count(cursor, marina_id)
+        if len(photos) > allowed:
+            raise RunmodeError(
+                400, f"An upload takes at most one photo per reference photo ({allowed}), not {len(photos)}"
+            )
+
+        uploads = []
+        connection.begin()
+        try:
+            cursor.execute(
+                "INSERT INTO upload_batches (marina_id, photo_count, created_by) VALUES (%s, %s, %s)",
+                (marina_id, len(photos), user["id"]),
+            )
+            batch_id = cursor.lastrowid
+            for photo in photos:
+                key = f"marinas/{marina_id}/images/{uuid.uuid4().hex}.{IMAGE_TYPES[photo['content_type']]}"
+                cursor.execute(
+                    "INSERT INTO marina_images (marina_id, s3_key, content_type, file_size_bytes, uploaded_by) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (marina_id, key, photo["content_type"], photo["file_size"], user["id"]),
+                )
+                uploads.append((cursor.lastrowid, key, photo))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    return {
+        "batch_id": batch_id,
+        "photos": [
+            {"image_id": image_id, "upload": storage.presigned_upload(key, photo["content_type"], photo["file_size"])}
+            for image_id, key, photo in uploads
+        ],
+    }
+
+
+def confirm_batch(payload, event):
+    """{"batch_id", "photos": [{"image_id", "width_px", "height_px", "reference_id"?}]} -> {"batch_id", "jobs"}
+
+    Queues an analysis job for each uploaded photo. reference_id picks the reference photo
+    by hand; left out, the worker finds it ("auto-detect"), pairing the upload's photos
+    one-to-one with reference photos. Confirming the same photos again queues nothing new.
+    """
+    batch_id = _positive_int(payload, "batch_id")
+    photos = payload.get("photos")
+    if not isinstance(photos, list) or not photos:
+        raise RunmodeError(400, "photos must be a non-empty list")
+    parsed = []
+    for i, photo in enumerate(photos):
+        if not isinstance(photo, dict):
+            raise RunmodeError(400, f"photos[{i}] must be an object")
+        parsed.append({
+            "image_id": _positive_int(photo, "image_id"),
+            "width_px": _positive_int(photo, "width_px"),
+            "height_px": _positive_int(photo, "height_px"),
+            "reference_id": _positive_int(photo, "reference_id") if photo.get("reference_id") is not None else None,
+        })
+    if len({photo["image_id"] for photo in parsed}) != len(parsed):
+        raise RunmodeError(400, "Each photo can be listed once")
+    chosen = [photo["reference_id"] for photo in parsed if photo["reference_id"]]
+    if len(set(chosen)) != len(chosen):
+        raise RunmodeError(400, "Two photos are set to the same reference photo: an upload takes one photo per reference photo")
+
+    connection = get_connection()
+    with connection.cursor() as cursor:
+        user = _require_marina_user(cursor, user_id(event))
+        marina_id = user["marina_id"]
+        cursor.execute("SELECT id, photo_count FROM upload_batches WHERE id = %s AND marina_id = %s", (batch_id, marina_id))
+        batch = cursor.fetchone()
+        if batch is None:
+            raise RunmodeError(404, "Upload not found")
+        if len(parsed) > batch["photo_count"]:
+            raise RunmodeError(400, f"This upload was started for {batch['photo_count']} photo(s)")
+        for reference_id in chosen:
+            reference = _get_reference(cursor, reference_id, marina_id)
+            if not reference["slip_count"]:
+                raise RunmodeError(409, f"Reference photo '{reference['name']}' has no slips yet")
+
+        images = []
+        for photo in parsed:
+            image = _get_image(cursor, photo["image_id"], marina_id)
+            if _reference_using_image(cursor, image["id"]):
+                raise RunmodeError(409, "That is a reference photo")
+            job = _get_job(cursor, image["id"])
+            if job and job["batch_id"] != batch_id:
+                raise RunmodeError(409, "A photo in this list was already uploaded separately")
+            images.append((image, photo, job))
+
+        connection.begin()
+        try:
+            for image, photo, job in images:
+                if job:
+                    continue  # confirmed before
+                _confirm_upload(cursor, image, photo["width_px"], photo["height_px"])
+                cursor.execute(
+                    "INSERT INTO analysis_jobs (marina_id, image_id, reference_id, batch_id) VALUES (%s, %s, %s, %s)",
+                    (marina_id, image["id"], photo["reference_id"], batch_id),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        return {"batch_id": batch_id, "jobs": [_get_job(cursor, photo["image_id"]) for photo in parsed]}
+
+
 MAX_REFERENCES = 50
 
 
@@ -249,7 +379,14 @@ def delete_reference(payload, event):
         user = _require_marina_user(cursor, user_id(event))
         marina_id = user["marina_id"]
         reference = _get_reference(cursor, reference_id, marina_id)
-        cursor.execute("SELECT image_id, status FROM analysis_jobs WHERE reference_id = %s", (reference_id,))
+        cursor.execute("SELECT COUNT(*) AS n FROM reference_photos WHERE marina_id = %s", (marina_id,))
+        last = cursor.fetchone()["n"] == 1
+        # The last one takes the marina back to the start, including uploads still waiting to be matched
+        cursor.execute(
+            "SELECT id, image_id, status FROM analysis_jobs WHERE reference_id = %s"
+            + (" OR (marina_id = %s AND reference_id IS NULL)" if last else ""),
+            (reference_id, marina_id) if last else (reference_id,),
+        )
         jobs = cursor.fetchall()
         if any(job["status"] == "running" for job in jobs):
             raise RunmodeError(409, "An update is being analyzed against this photo. Try again once it finishes.")
@@ -266,7 +403,15 @@ def delete_reference(payload, event):
             )
             labels = cursor.rowcount
             cursor.execute(f"DELETE FROM slip_observations WHERE image_id IN ({in_images})", image_ids)
-            cursor.execute("DELETE FROM analysis_jobs WHERE reference_id = %s", (reference_id,))  # and their steps
+            if jobs:  # and their steps
+                cursor.execute(
+                    f"DELETE FROM analysis_jobs WHERE id IN ({', '.join(['%s'] * len(jobs))})", [job["id"] for job in jobs]
+                )
+            cursor.execute(
+                "DELETE FROM upload_batches WHERE marina_id = %s AND id NOT IN "
+                "(SELECT batch_id FROM analysis_jobs WHERE batch_id IS NOT NULL)",
+                (marina_id,),
+            )
             cursor.execute("DELETE FROM slips WHERE reference_id = %s", (reference_id,))
             slips = cursor.rowcount
             _delete_unused_docks(cursor, marina_id)
@@ -314,8 +459,11 @@ def _image_keys(cursor, image_ids, in_images):
 
 
 def retry_analysis(payload, event):
-    """{"image_id", "reference_id"?} -> {"job"}. Puts a failed analysis job back in the queue,
-    optionally comparing it with a different reference photo this time."""
+    """{"image_id", "reference_id"?} -> {"job"}. Puts a failed analysis job back in the queue.
+
+    reference_id compares it with that reference photo this time. Left out, a photo whose
+    reference photo was chosen by hand keeps it; one the worker matched is matched again.
+    """
     image_id = _positive_int(payload, "image_id")
     with get_connection().cursor() as cursor:
         user = _require_marina_user(cursor, user_id(event))
@@ -325,13 +473,16 @@ def retry_analysis(payload, event):
             raise RunmodeError(404, "No analysis job for that image")
         if job["status"] != "failed":
             raise RunmodeError(409, f"Only failed jobs can be retried (this one is {job['status']})")
-        reference_id = job["reference_id"]
-        if payload.get("reference_id") is not None or reference_id is None:
-            reference_id = _chosen_reference(cursor, payload, user["marina_id"])["id"]
+        if payload.get("reference_id") is not None:
+            reference_id = _get_reference(cursor, _positive_int(payload, "reference_id"), user["marina_id"])["id"]
+        elif job["match_scores"] is not None:
+            reference_id = None  # the worker picked it last time: let it match again
+        else:
+            reference_id = job["reference_id"]
         cursor.execute(
             "UPDATE analysis_jobs SET status = 'pending', progress = NULL, message = NULL, worker_id = NULL, "
             "queued_at = CURRENT_TIMESTAMP, started_at = NULL, heartbeat_at = NULL, finished_at = NULL, "
-            "reference_id = %s WHERE id = %s",
+            "reference_id = %s, match_scores = NULL WHERE id = %s",
             (reference_id, job["id"]),
         )
         return {"job": _get_job(cursor, image_id)}
@@ -577,6 +728,8 @@ RUNMODES = {
     "create_marina": create_marina,
     "create_image_upload": create_image_upload,
     "confirm_image": confirm_image,
+    "create_upload_batch": create_upload_batch,
+    "confirm_batch": confirm_batch,
     "create_reference": create_reference,
     "rename_reference": rename_reference,
     "delete_reference": delete_reference,
@@ -640,12 +793,28 @@ def _get_image(cursor, image_id, marina_id):
     return image
 
 
-JOB_COLUMNS = "id, image_id, reference_id, status, progress, message, attempts, queued_at, started_at, finished_at"
+JOB_COLUMNS = (
+    "id, image_id, reference_id, batch_id, match_scores, status, progress, message, attempts, queued_at, "
+    "started_at, finished_at"
+)
 
 
 def _get_job(cursor, image_id):
     cursor.execute(f"SELECT {JOB_COLUMNS} FROM analysis_jobs WHERE image_id = %s", (image_id,))
-    return cursor.fetchone()
+    job = cursor.fetchone()
+    if job and isinstance(job["match_scores"], str):  # pymysql returns JSON columns as text
+        job["match_scores"] = json.loads(job["match_scores"])
+    return job
+
+
+def _usable_reference_count(cursor, marina_id):
+    """Reference photos an update can be compared with (those with slips)."""
+    cursor.execute(
+        "SELECT COUNT(*) AS n FROM reference_photos r WHERE r.marina_id = %s "
+        "AND EXISTS (SELECT 1 FROM slips s WHERE s.reference_id = r.id)",
+        (marina_id,),
+    )
+    return cursor.fetchone()["n"]
 
 
 def _slip_count(cursor, marina_id, reference_id=None):

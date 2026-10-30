@@ -96,11 +96,22 @@ CREATE TABLE slips (
   UNIQUE (marina_id, label)
 );
 
+CREATE TABLE upload_batches (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  marina_id   INTEGER NOT NULL REFERENCES marinas(id),
+  photo_count INTEGER NOT NULL,
+  created_by  INTEGER NOT NULL REFERENCES users(id),
+  created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  matched_at  TIMESTAMP
+);
+
 CREATE TABLE analysis_jobs (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   marina_id    INTEGER NOT NULL REFERENCES marinas(id),
   image_id     INTEGER NOT NULL UNIQUE REFERENCES marina_images(id),
   reference_id INTEGER REFERENCES reference_photos(id) ON DELETE SET NULL,
+  batch_id     INTEGER REFERENCES upload_batches(id) ON DELETE SET NULL,
+  match_scores JSON,
   status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'succeeded', 'failed')),
   progress     INTEGER,
   message      VARCHAR(255),

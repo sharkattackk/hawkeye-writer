@@ -823,3 +823,121 @@ def test_remove_other_marinas_label(handler, s3):
     label(handler, image_id, slip_id, "boat")
     setup_marina(handler, OTHER_USER)
     assert call(handler, {"runmode": "remove_label", "label_id": label_id(handler)}, OTHER_USER)[0] == 404
+
+
+# --- uploading several drone photos at once
+
+def two_reference_marina(handler, s3):
+    """A calibrated marina with Main (A1) and South (B1) -> (main id, south id)."""
+    calibrate(handler, s3)
+    south = upload_reference(handler, s3, name="South")
+    save(handler, [{"label": "B1", "polygon": SQUARE}], reference_id=south["id"])
+    main_id = query(handler, "SELECT id FROM reference_photos WHERE name = 'Main'")[0]["id"]
+    return main_id, south["id"]
+
+
+def start_batch(handler, s3, count, user=USER):
+    status, body = call(handler, {
+        "runmode": "create_upload_batch",
+        "photos": [{"content_type": "image/jpeg", "file_size": 100 + i} for i in range(count)],
+    }, user)
+    if status == 200:
+        for i, photo in enumerate(body["photos"]):  # the browser uploads each file
+            s3.objects[photo["upload"]["fields"]["key"]] = {"size": 100 + i, "content_type": "image/jpeg"}
+    return status, body
+
+
+def confirm(handler, batch, photos, user=USER):
+    return call(handler, {"runmode": "confirm_batch", "batch_id": batch["batch_id"], "photos": photos}, user)
+
+
+def photo(entry, reference_id=None):
+    item = {"image_id": entry["image_id"], "width_px": 4000, "height_px": 3000}
+    if reference_id:
+        item["reference_id"] = reference_id
+    return item
+
+
+def test_an_upload_takes_at_most_one_photo_per_reference_photo(handler, s3):
+    main_id, south_id = two_reference_marina(handler, s3)
+    upload_reference(handler, s3, name="Empty")  # no slips yet: doesn't count
+    status, body = start_batch(handler, s3, 3)
+    assert status == 400 and "at most one photo per reference photo (2)" in body["error"]
+    status, body = start_batch(handler, s3, 2)
+    assert status == 200 and len(body["photos"]) == 2
+    assert query(handler, "SELECT photo_count FROM upload_batches") == [{"photo_count": 2}]
+
+
+def test_upload_batch_requires_calibration_and_valid_photos(handler, s3):
+    setup_marina(handler)
+    assert start_batch(handler, s3, 1)[0] == 409
+    for photos in ([], "x", [{"content_type": "image/gif", "file_size": 5}], [{"content_type": "image/jpeg", "file_size": 0}]):
+        assert call(handler, {"runmode": "create_upload_batch", "photos": photos})[0] in (400, 409)
+
+
+def test_confirm_batch_queues_auto_detect_and_chosen_photos(handler, s3):
+    main_id, south_id = two_reference_marina(handler, s3)
+    _, batch = start_batch(handler, s3, 2)
+    first, second = batch["photos"]
+    status, body = confirm(handler, batch, [photo(first), photo(second, south_id)])
+    assert status == 200
+    jobs = {job["image_id"]: job for job in body["jobs"]}
+    assert jobs[first["image_id"]]["reference_id"] is None  # the worker will find it
+    assert jobs[second["image_id"]]["reference_id"] == south_id
+    assert {job["batch_id"] for job in body["jobs"]} == {batch["batch_id"]}
+    assert all(job["status"] == "pending" for job in body["jobs"])
+
+    # confirming again queues nothing new
+    again = confirm(handler, batch, [photo(first), photo(second, south_id)])
+    assert again[0] == 200 and len(query(handler, "SELECT id FROM analysis_jobs")) == 2
+
+
+def test_confirm_batch_rules(handler, s3):
+    main_id, south_id = two_reference_marina(handler, s3)
+    _, batch = start_batch(handler, s3, 2)
+    first, second = batch["photos"]
+    assert confirm(handler, batch, [photo(first, south_id), photo(second, south_id)])[0] == 400  # same reference twice
+    assert confirm(handler, batch, [photo(first), photo(first)])[0] == 400
+    empty = upload_reference(handler, s3, name="Empty")
+    assert confirm(handler, batch, [photo(first, empty["id"])])[0] == 409  # no slips to analyze
+    _, small = start_batch(handler, s3, 1)
+    assert confirm(handler, small, [photo(small["photos"][0]), photo(first)])[0] == 400  # started for 1
+
+    # nothing is queued if a photo never reached S3
+    del s3.objects[query(handler, "SELECT s3_key FROM marina_images WHERE id = %s", (second["image_id"],))[0]["s3_key"]]
+    status, body = confirm(handler, batch, [photo(first), photo(second)])
+    assert status == 400 and query(handler, "SELECT id FROM analysis_jobs") == []
+
+    # a photo already uploaded on its own can't join
+    _, update = upload_update(handler, s3, reference_id=main_id)
+    single = {"image_id": update["image"]["id"]}
+    assert confirm(handler, batch, [photo(single)])[0] == 409
+
+    setup_marina(handler, OTHER_USER)
+    assert confirm(handler, batch, [photo(first)], OTHER_USER)[0] == 404
+
+
+def test_retrying_an_auto_matched_photo_matches_it_again(handler, s3):
+    main_id, south_id = two_reference_marina(handler, s3)
+    _, batch = start_batch(handler, s3, 2)
+    confirm(handler, batch, [photo(batch["photos"][0]), photo(batch["photos"][1], south_id)])
+    auto_image, chosen_image = batch["photos"][0]["image_id"], batch["photos"][1]["image_id"]
+    query(handler, "UPDATE analysis_jobs SET status = 'failed'")
+    query(handler, "UPDATE analysis_jobs SET reference_id = %s, match_scores = %s WHERE image_id = %s",
+          (main_id, json.dumps({str(main_id): {"points": 50, "fits": True}}), auto_image))
+
+    _, body = call(handler, {"runmode": "retry_analysis", "image_id": auto_image})
+    assert body["job"]["reference_id"] is None and body["job"]["match_scores"] is None
+    _, body = call(handler, {"runmode": "retry_analysis", "image_id": chosen_image})
+    assert body["job"]["reference_id"] == south_id  # chosen by hand: kept
+
+
+def test_resetting_the_marina_also_removes_uploads_waiting_to_be_matched(handler, s3):
+    calibrate(handler, s3)
+    main_id = query(handler, "SELECT id FROM reference_photos")[0]["id"]
+    _, batch = start_batch(handler, s3, 1)
+    confirm(handler, batch, [photo(batch["photos"][0])])
+    status, body = call(handler, {"runmode": "delete_reference", "reference_id": main_id})
+    assert status == 200 and body["deleted"]["updates"] == 1 and body["calibrated"] is False
+    assert query(handler, "SELECT id FROM analysis_jobs") == []
+    assert query(handler, "SELECT id FROM upload_batches") == []
